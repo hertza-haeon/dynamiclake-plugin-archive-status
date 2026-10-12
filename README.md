@@ -1,7 +1,7 @@
 # Archive Status
 
 <p align="center">
-  <img src="icon.png" alt="Archive Status icon" width="128">
+  <img src="icon-rounded.png" alt="Archive Status icon" width="128">
 </p>
 
 <p align="center">
