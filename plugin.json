@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.hertzahaeon.plugins.archive-status",
   "name": "Archive Status",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "developerName": "Hertza Haeon",
   "description": "Extractions in the notch: how far they are, the speed or the time left, then Show in Finder and Open. Several at once share one card. For MacPacker, The Unarchiver, Keka and Archive Utility. No permission needed.",
   "executable": "archive-status",
@@ -25,7 +25,7 @@
       "title": "Extraction Details",
       "description": "What follows the amount while extracting: the speed, the time left, or both, taking turns every 3 seconds.",
       "systemImage": "t.circle",
-      "tint": "teal",
+      "tint": "green",
       "options": [
         {
           "title": "Speed",
@@ -48,7 +48,7 @@
       "title": "Delayed Display",
       "description": "While you're away, extractions that end don't open the notch. Their card opens when you're back.",
       "systemImage": "hourglass",
-      "tint": "red",
+      "tint": "orange",
       "default": true
     },
     {
@@ -111,7 +111,7 @@
       "title": "Remain Visible",
       "description": "How long the closed pill stays after that sneak peek. At 0 it goes away together with the sneak peek.",
       "systemImage": "capsule",
-      "tint": "blue",
+      "tint": "gray",
       "min": 0,
       "max": 30,
       "step": 1,
@@ -124,7 +124,7 @@
       "title": "Minimum Duration",
       "description": "How long an extraction must take, at least, to get its pill and card. The plugin works it out from the speed, a moment after it begins. At 0 every extraction shows.",
       "systemImage": "stopwatch",
-      "tint": "orange",
+      "tint": "gray",
       "min": 0,
       "max": 60,
       "step": 1,
