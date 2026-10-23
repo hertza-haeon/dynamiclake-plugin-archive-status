@@ -27,7 +27,9 @@ public enum Tool: String, Sendable, CaseIterable {
     /// Unarchiver extract by themselves; Archive Utility hands the work to
     /// a helper. Keka hands each archive to a helper of its own, named
     /// after what it runs (`kekaunar`, `keka7zz`, `kekatar`…): for Keka,
-    /// this is how those names begin.
+    /// this is how those names begin. So it is for MacPacker, whose builds
+    /// are named differently: `MacPacker`, `MacPackerStore` from the App
+    /// Store, and others for a build made by someone else.
     var processName: String {
         switch self {
         case .macPacker: "MacPacker"
@@ -42,6 +44,15 @@ public enum Tool: String, Sendable, CaseIterable {
     /// too, reading whatever they compress.
     var opensOnlyToExtract: Bool {
         self == .archiveUtility || self == .theUnarchiver
+    }
+
+    /// Whether what the tool reads among the user's files is an archive it
+    /// extracts, whatever its name: The Unarchiver and Keka's helpers
+    /// read nothing else there while they extract (a real Mac, 13 Oct
+    /// 2026), and both know many more kinds of archive than this plugin
+    /// has names for. (Keka's helpers also compress: see the tracker.)
+    var extractsWhateverItsName: Bool {
+        self == .theUnarchiver || self == .keka
     }
 
     /// Whether the tool has every archive it was given open from the
@@ -67,7 +78,10 @@ public enum Tool: String, Sendable, CaseIterable {
     /// `…/TemporaryItems/NSIRD_ArchiveService_XXXXXX`, The Unarchiver a
     /// hidden `.TheUnarchiverTemp0` where the result will go, Keka
     /// `photos.kextraction` there. Nothing for a file written anywhere
-    /// else, and for MacPacker, which writes at the final place.
+    /// else, and for MacPacker, which writes at the final place, or, in
+    /// builds that keep a cancelled extraction from leaving anything
+    /// behind, in a `photos.macpack` folder there: the tracker follows
+    /// that one itself (`Tracker.macPackerWorkFolder`).
     func workFolder(of path: String) -> String? {
         let parts = path.split(separator: "/", omittingEmptySubsequences: true)
         let work: Int?
@@ -102,6 +116,9 @@ public enum Tool: String, Sendable, CaseIterable {
     static func named(_ processName: String) -> Tool? {
         // (The Keka app itself is `Keka`, with a capital.)
         if processName.hasPrefix(Tool.keka.processName) { return .keka }
+        // (MacPacker's Finder and Quick Look extensions are
+        // `FinderExtension` and `QuickLookExtension`.)
+        if processName.hasPrefix(Tool.macPacker.processName) { return .macPacker }
         return allCases.first { $0.processName == processName }
     }
 

@@ -15,7 +15,7 @@ public enum Preview {
     /// Writes each picture as a PNG into `folder` and returns the files' names.
     public static func writePictures(to folder: String) -> [String] {
         let kinds: [(String, PictureKind)] = [
-            ("box", .box), ("done", .done), ("stopped", .stopped), ("stalled", .stalled),
+            ("box", .box), ("done", .done), ("stopped", .stopped), ("stalled", .stalled), ("unchecked", .unchecked), ("incomplete", .incomplete),
             ("type-zip", .type("zip")), ("type-rar", .type("rar")), ("type-7z", .type("7z")),
             ("type-tgz", .type("tgz")), ("type-gz", .type("gz")),
             ("several-2", .type("2")), ("several-3", .type("3")), ("several-4", .type("4")), ("several-7", .type("7")),

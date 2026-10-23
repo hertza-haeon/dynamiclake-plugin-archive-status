@@ -124,11 +124,57 @@ struct MacPackerCopyTrackingTests {
         #expect(Set(tracker.ended.map(\.id)).count == 2)
     }
 
+    /// Seen on a real Mac, 13 Oct 2026: a `tar.bz2` of 492 MB opened in
+    /// MacPacker, then extracted from MacPacker's copy in under a second,
+    /// showed nothing (no list: the card came and went in one look). Its
+    /// list is read beside the loop from the moment MacPacker unpacks it,
+    /// kept while MacPacker keeps its copy, and there when the extraction
+    /// is asked for.
+    @Test func aLargeArchivesListIsReadBesideTheLoopWhileMacPackerUnpacksIt() throws {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        #expect(unpack(&tracker, archive, into: copy).isEmpty)
+        #expect(mac.laterBegun == [archive])
+        #expect(mac.indexReads.isEmpty, "the loop didn't stand still for it")
+        #expect(mac.laterDropped.isEmpty, "kept: MacPacker has its copy to extract from")
+        // The list is read meanwhile. A minute later the extraction is
+        // asked for, and its first files are there.
+        mac.finishLaterIndex(entries, for: archive)
+        mac.clock += 60
+        mac.put(.file(size: 8_192), at: file(0))
+        mac.put(.file(size: 8_192), at: file(1))
+        var lines = tracker.step(now: 60, processes: [macPacker([reading(copy, size: copySize, at: 900_000_000)])])
+        #expect(lines.first == "6 no index.tar.gz: its list of contents is read: 8.2 MB in 1,000 files (compressed tar)")
+        lines += tracker.step(now: 60.1, processes: [macPacker([reading(copy, size: copySize, at: 900_000_000)])])
+        #expect(lines.contains { $0.hasPrefix("6 no index.tar.gz: MacPacker is extracting it: 8.2 MB in 1,000 files (compressed tar") })
+        let extraction = try #require(tracker.extractions.first)
+        #expect(extraction.total == 8_192_000)
+        #expect(extraction.measuresArchive == false)
+        // All of it written, the copy still held: complete.
+        for number in 0..<1_000 {
+            mac.put(.file(size: 8_192), at: file(number))
+        }
+        _ = tracker.step(now: 61, processes: [macPacker([reading(copy, size: copySize, at: copySize)])])
+        _ = tracker.step(now: 62, processes: [macPacker([])])
+        #expect(tracker.ended.last?.ending == .complete)
+    }
+
+    /// MacPacker gone, its copy is gone with it: the list isn't read on.
+    @Test func theListIsGivenUpWhenMacPackerIsGone() {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        _ = unpack(&tracker, archive, into: copy)
+        #expect(mac.laterDropped.isEmpty)
+        _ = tracker.step(now: 10, processes: [])
+        _ = tracker.step(now: 11, processes: [])
+        #expect(mac.laterDropped == [archive])
+    }
+
     /// The archive may take too long to read, or hold no tar: then how
     /// far MacPacker has read into its copy is the measure, of the copy's
     /// size.
     @Test(arguments: [
-        (IndexError.tooLarge, "it lists too many items, or takes too long to read"),
+        (IndexError.tooLarge, "it takes long to read: its list is being read meanwhile"),
         (.notAnArchive, "this kind of archive has no index to read"),
         (.unreadable, "the archive can't be read"),
     ])
@@ -155,9 +201,105 @@ struct MacPackerCopyTrackingTests {
         extraction = try #require(tracker.extractions.first)
         #expect(extraction.written == 806_593_792)
 
-        // Without an index, whether it got to its end can't be told.
+        // Without an index, whether it got to its end can't be told. (A
+        // list being read beside the loop is waited for first.)
         lines = tracker.step(now: 62, processes: [macPacker([])])
+        if error == .tooLarge {
+            #expect(tracker.ended.isEmpty, "the list may yet come")
+            mac.clock += Tracker.listWait + 1
+            lines = tracker.step(now: 83, processes: [macPacker([])])
+        }
         #expect(tracker.ended.last?.ending == .unknown)
+    }
+
+    /// Seen on a real Mac, 13 Oct 2026: MacPacker opened a `tar.bz2`
+    /// (sixteen seconds to unpack into its copy), and the extraction from
+    /// the copy was asked for at once and over in under a second, four
+    /// seconds before the plugin had read the archive's list. Nothing
+    /// showed. Now the list is waited for, and the archive's first files
+    /// are looked for where MacPacker puts them.
+    @Test func anExtractionOverBeforeTheListIsReadIsTakenUpFromWhatItLeft() throws {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        _ = unpack(&tracker, archive, into: copy)
+        // Asked for at once: MacPacker has its copy for half a second, and
+        // not one file is caught being written.
+        var lines = tracker.step(now: 2.4, processes: [macPacker([reading(copy, size: copySize, at: 900_000_000)])])
+        lines += tracker.step(now: 2.6, processes: [macPacker([reading(copy, size: copySize, at: copySize)])])
+        for number in 0..<1_000 {
+            mac.put(.file(size: 8_192), at: file(number))
+        }
+        lines += tracker.step(now: 2.9, processes: [macPacker([])])
+        #expect(lines.isEmpty)
+        #expect(tracker.attention == .close, "not let go of yet: its list is on its way")
+        // The list is there four seconds later.
+        mac.clock += 4
+        mac.finishLaterIndex(entries, for: archive)
+        lines = tracker.step(now: 6.9, processes: [macPacker([])])
+        #expect(lines.first == "6 no index.tar.gz: its list of contents is read: 8.2 MB in 1,000 files (compressed tar)")
+        #expect(lines.contains { $0.hasPrefix("6 no index.tar.gz: MacPacker is extracting it: 8.2 MB in 1,000 files (compressed tar") })
+        #expect(tracker.extractions.count == 1, "under way for a look, so that it gets its card")
+        lines = tracker.step(now: 7.0, processes: [macPacker([])])
+        #expect(lines.last?.hasPrefix("6 no index.tar.gz: complete: 8.2 MB in") == true)
+        let ended = try #require(tracker.ended.last)
+        #expect(ended.ending == .complete)
+        #expect(ended.result == "/Users/me/Downloads/many")
+    }
+
+    /// The same when the list never comes: nothing is said, and the wait
+    /// ends.
+    @Test func withoutAListInTimeAnExtractionNobodySawIsNotMadeUp() {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        _ = unpack(&tracker, archive, into: copy)
+        _ = tracker.step(now: 2.4, processes: [macPacker([reading(copy, size: copySize, at: 900_000_000)])])
+        _ = tracker.step(now: 2.6, processes: [macPacker([reading(copy, size: copySize, at: copySize)])])
+        #expect(tracker.step(now: 2.9, processes: [macPacker([])]).isEmpty)
+        mac.clock += Tracker.listWait + 1
+        #expect(tracker.step(now: 24, processes: [macPacker([])]).isEmpty)
+        #expect(tracker.extractions.isEmpty)
+        #expect(tracker.ended.isEmpty)
+        #expect(tracker.attention == .none)
+    }
+
+    /// The list is there, and MacPacker only looked into its copy: nothing
+    /// was extracted, and nothing is said.
+    @Test func lookingIntoTheCopyWithItsListReadIsNoExtraction() {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        _ = unpack(&tracker, archive, into: copy)
+        mac.finishLaterIndex(entries, for: archive)
+        mac.clock += 30
+        var lines = tracker.step(now: 30, processes: [macPacker([reading(copy, size: copySize, at: 900_000_000)])])
+        lines += tracker.step(now: 30.3, processes: [macPacker([])])
+        lines += tracker.step(now: 30.4, processes: [macPacker([])])
+        #expect(lines == ["6 no index.tar.gz: its list of contents is read: 8.2 MB in 1,000 files (compressed tar)"])
+        #expect(tracker.extractions.isEmpty)
+        #expect(tracker.ended.isEmpty)
+    }
+
+    /// A file of it was caught being written before the list was there:
+    /// followed without it, and at the end the list is waited for and the
+    /// files looked at by it, where the file caught says they went.
+    @Test func followedWithoutItsListThenLookedAtByItAtTheEnd() throws {
+        mac.setIndexFailure(.tooLarge, for: archive)
+        var tracker = mac.tracker()
+        _ = unpack(&tracker, archive, into: copy)
+        mac.clock += 4                                   // (the reading beside the loop has gone on longer than a look may)
+        var lines = tracker.step(now: 6, processes: [macPacker([reading(copy, size: copySize, at: 161_318_758), writing(file(3), size: 100)])])
+        #expect(lines.first?.contains("MacPacker is extracting it; no total to read (it takes long to read") == true)
+        #expect(mac.indexReads.isEmpty, "no second try at once")
+        for number in 0..<1_000 {
+            mac.put(.file(size: 8_192), at: file(number))
+        }
+        lines = tracker.step(now: 6.5, processes: [macPacker([])])
+        #expect(tracker.ended.isEmpty, "the list may yet come")
+        mac.finishLaterIndex(entries, for: archive)
+        lines = tracker.step(now: 8, processes: [macPacker([])])
+        #expect(lines.contains { $0.contains("its list of contents is read") })
+        let ended = try #require(tracker.ended.last)
+        #expect(ended.ending == .complete)
+        #expect(ended.result == "/Users/me/Downloads/many")
     }
 
     /// Seen on a real Mac (12 Oct, 150,000 files): MacPacker reads its
@@ -267,6 +409,84 @@ struct MacPackerCopyTrackingTests {
         let lines = tracker.step(now: 9, processes: [macPacker([reading(copy, size: copySize), writing(file(1), size: 100)])])
         #expect(lines.isEmpty)
         #expect(tracker.extractions.isEmpty)
+    }
+
+    /// Seen on a real Mac, 23 Oct 2026: a `tar.gz` cut into numbered
+    /// pieces. MacPacker has every piece open while it unpacks them into
+    /// its copy, which it names after the tar inside (`big.tar`). What it
+    /// extracted from the copy then went by the copy's name, was followed
+    /// by how far the copy was read, and showed Stopped once done. The
+    /// pieces are one archive: the copy is theirs.
+    @Test(arguments: [
+        ["/Users/me/Downloads/trip.tar.gz"],
+        ["/Users/me/Downloads/trip.tar.gz.001", "/Users/me/Downloads/trip.tar.gz.002", "/Users/me/Downloads/trip.tar.gz.003"],
+    ])
+    func whatIsExtractedFromTheCopyGoesByTheArchiveItWasUnpackedFrom(pieces: [String]) throws {
+        let first = try #require(pieces.first)
+        let tarCopy = "/Users/me/Library/Containers/com.sarensx.MacPacker.lab/Data/Library/Caches/ta/8DF5B201/big.tar"
+        mac.setIndex(entries, format: .compressedTar, for: first)
+        var tracker = mac.tracker()
+        for look in 0...21 {
+            _ = tracker.step(now: Double(look) / 10, processes: [macPacker(
+                pieces.map { reading($0, size: 104_857_600, at: 3_145_728) }
+                    + [writing(tarCopy, size: UInt64(look + 1) * 73_000_000)]
+            )])
+        }
+        _ = tracker.step(now: 2.2, processes: [macPacker([])])
+
+        _ = tracker.step(now: 60, processes: [
+            macPacker([reading(tarCopy, size: copySize, at: 131_072), writing(file(9), size: 4_000)]),
+        ])
+        let extraction = try #require(tracker.extractions.first)
+        #expect(extraction.name == ArchiveName.fileName(of: first))
+        #expect(extraction.archivePath == first)
+        #expect(extraction.total == 8_192_000)
+        #expect(extraction.measuresArchive == false)
+
+        for number in 0..<1_000 {
+            mac.put(.file(size: 8_192), at: file(number))
+        }
+        _ = tracker.step(now: 61, processes: [macPacker([])])
+        #expect(tracker.ended.map(\.name) == [ArchiveName.fileName(of: first)])
+        #expect(tracker.ended.last?.ending == .complete)
+    }
+
+    /// The same, with a list too long to read within a look (300 MB on
+    /// the real Mac): it is read beside the loop, and kept while MacPacker
+    /// keeps the copy of the pieces.
+    @Test func theListOfAnArchiveInPiecesIsKeptWhileMacPackerKeepsItsCopy() throws {
+        let pieces = ["/Users/me/Downloads/trip.tar.gz.001", "/Users/me/Downloads/trip.tar.gz.002"]
+        let tarCopy = "/Users/me/Library/Containers/com.sarensx.MacPacker.lab/Data/Library/Caches/ta/8DF5B201/big.tar"
+        mac.setIndexFailure(.tooLarge, for: pieces[0])
+        var tracker = mac.tracker()
+        for look in 0...21 {
+            _ = tracker.step(now: Double(look) / 10, processes: [macPacker(
+                pieces.map { reading($0, size: 104_857_600, at: 3_145_728) }
+                    + [writing(tarCopy, size: UInt64(look + 1) * 73_000_000)]
+            )])
+        }
+        _ = tracker.step(now: 2.2, processes: [macPacker([])])
+        _ = tracker.step(now: 3, processes: [macPacker([])])
+        #expect(mac.laterBegun == [pieces[0]])
+        #expect(mac.laterDropped.isEmpty, "kept: MacPacker has its copy to extract from")
+
+        mac.finishLaterIndex(entries, for: pieces[0])
+        mac.clock += 60
+        _ = tracker.step(now: 60, processes: [
+            macPacker([reading(tarCopy, size: copySize, at: 131_072), writing(file(9), size: 4_000)]),
+        ])
+        _ = tracker.step(now: 60.1, processes: [
+            macPacker([reading(tarCopy, size: copySize, at: 131_072), writing(file(10), size: 4_000)]),
+        ])
+        let extraction = try #require(tracker.extractions.first)
+        #expect(extraction.name == "trip.tar.gz.001")
+        #expect(extraction.total == 8_192_000)
+        #expect(extraction.measuresArchive == false)
+        for number in 0..<1_000 {
+            mac.put(.file(size: 8_192), at: file(number))
+        }
+        _ = tracker.step(now: 61, processes: [macPacker([])])
+        #expect(tracker.ended.last?.ending == .complete)
     }
 
     @Test func aProgramThatIsGoneTakesItsCopiesWithIt() {

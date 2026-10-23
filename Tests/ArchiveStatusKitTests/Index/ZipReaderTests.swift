@@ -26,6 +26,30 @@ struct ZipReaderTests {
         try ArchiveIndex.read(at: scratch.write(bytes, as: name))
     }
 
+    /// Seen on a real Mac, 13 Oct 2026: a zip cut into `.001`, `.002`…
+    /// (its pieces put end to end are the zip) was extracted by The
+    /// Unarchiver, and not known to the plugin.
+    @Test func aZipCutIntoNumberedPiecesIsReadAsOne() throws {
+        let items = [ZipItem("a.txt", size: 10), ZipItem("folder/b.bin", size: 2_000), ZipItem("folder/c.dat", size: 300_000)]
+        let whole = makeZip(items)
+        let cut = [0, whole.count / 3, whole.count / 3 + 1, whole.count - 20, whole.count]
+        var pieces: [String] = []
+        for number in 1..<cut.count {
+            pieces.append(try scratch.write(Array(whole[cut[number - 1]..<cut[number]]), as: "cut.zip.00\(number)"))
+        }
+        let index = try ArchiveIndex.read(at: pieces[0])
+        #expect(index.format == .zip)
+        #expect(index.entries == [
+            ArchiveEntry(path: "a.txt", size: 10),
+            ArchiveEntry(path: "folder/b.bin", size: 2_000),
+            ArchiveEntry(path: "folder/c.dat", size: 300_000),
+        ])
+        #expect(index.parts == pieces)
+        // With a piece missing the rest is no zip: refused, never guessed.
+        try FileManager.default.removeItem(atPath: pieces[3])
+        #expect(throws: IndexError.self) { try ArchiveIndex.read(at: pieces[0]) }
+    }
+
     @Test func itemsComeInTheOrderOfTheIndexWithTheirSizes() throws {
         let index = try index(of: makeZip([
             ZipItem("a.txt", size: 10),

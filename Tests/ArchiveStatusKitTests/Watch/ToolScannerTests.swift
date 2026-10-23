@@ -47,6 +47,19 @@ struct ToolScannerTests {
         #expect(found.map(\.tool) == [.macPacker, .archiveUtility])
     }
 
+    /// MacPacker's builds are named differently: `MacPacker`, `MacPackerStore`
+    /// for the App Store's, and more for a build made by someone else. Its
+    /// Finder and Quick Look extensions extract nothing.
+    @Test func everyBuildOfMacPackerIsFoundByHowItsNameBegins() {
+        let programs = Programs()
+        programs.names = [20: "MacPacker", 21: "MacPackerStore", 22: "MacPacker Lab",
+                          30: "FinderExtension", 31: "QuickLookExtension", 32: "Packer", 33: "Mac"]
+        var scanner = programs.scanner()
+        let found = scanner.scan().sorted { $0.pid < $1.pid }
+        #expect(found.map(\.pid) == [20, 21, 22])
+        #expect(found.allSatisfy { $0.tool == .macPacker })
+    }
+
     /// Keka gives each archive to a helper named after what it runs; the
     /// app itself, and what it adds to the Finder, extract nothing.
     @Test func kekasHelpersAreFoundByHowTheirNamesBegin() {

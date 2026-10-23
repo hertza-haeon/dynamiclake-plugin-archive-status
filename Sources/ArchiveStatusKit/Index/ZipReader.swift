@@ -88,7 +88,7 @@ enum ZipReader {
         }
         // Fewer items than announced: the index stops short.
         let isWhole = listed >= end.entryCount
-        return ArchiveIndex(format: .zip, entries: entries, parts: [source.path],
+        return ArchiveIndex(format: .zip, entries: entries, parts: source.paths,
                             needsPassword: needsPassword, isWhole: isWhole)
     }
 

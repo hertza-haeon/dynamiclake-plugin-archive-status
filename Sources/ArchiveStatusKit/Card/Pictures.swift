@@ -22,6 +22,12 @@ enum PictureKind: Hashable {
     case stopped
     /// Three dots in a red circle: stalled.
     case stalled
+    /// A bar in a grey circle: done, with a result that couldn't be
+    /// checked (Firefox Downloads' "blocked" picture, in grey).
+    case unchecked
+    /// A ring in a red circle: incomplete, extracted to the archive's end
+    /// with files missing.
+    case incomplete
 }
 
 /// Draws the plugin's pictures, in the look of Firefox Downloads': a full
@@ -60,13 +66,14 @@ final class Pictures {
 
     // MARK: Drawing
 
-    /// The blue, the green and the red of DynamicLake's own symbols, and
-    /// how dark the circle is.
+    /// The blue, the green, the red and the grey of DynamicLake's own
+    /// symbols, and how dark the circle is.
     private static func look(_ kind: PictureKind) -> (red: Double, green: Double, blue: Double, dim: Double) {
         switch kind {
         case .type, .box: (10.0 / 255, 132.0 / 255, 1.0, 0.24)
         case .done: (48.0 / 255, 209.0 / 255, 88.0 / 255, 0.22)
-        case .stopped, .stalled: (1.0, 69.0 / 255, 58.0 / 255, 0.22)
+        case .stopped, .stalled, .incomplete: (1.0, 69.0 / 255, 58.0 / 255, 0.22)
+        case .unchecked: (142.0 / 255, 142.0 / 255, 147.0 / 255, 0.22)
         }
     }
 
@@ -144,6 +151,14 @@ final class Pictures {
             for x in [0.33, 0.5, 0.67] {
                 stroke(0.098, x, 0.5, x, 0.5)
             }
+        case .unchecked:
+            // A horizontal bar.
+            stroke(0.085, 0.33, 0.5, 0.67, 0.5)
+        case .incomplete:
+            // A ring, between the cross's width and the progress ring's.
+            let radius = side * 0.215
+            context.setLineWidth(side * 0.078)
+            context.strokeEllipse(in: CGRect(x: side / 2 - radius, y: side / 2 - radius, width: radius * 2, height: radius * 2))
         }
 
         guard let image = context.makeImage() else { return nil }

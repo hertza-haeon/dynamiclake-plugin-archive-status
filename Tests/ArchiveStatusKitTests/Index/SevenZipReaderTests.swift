@@ -43,6 +43,26 @@ struct SevenZipReaderTests {
         #expect(index.isWhole)
     }
 
+    /// Seen on a real Mac, 13 Oct 2026: a 7z cut into `.001`, `.002`…
+    /// was extracted by The Unarchiver and by Keka, and not known to the
+    /// plugin. Its index is at its end, in the last piece.
+    @Test(.tags(.systemTools))
+    func a7zCutIntoNumberedPiecesIsReadAsOne() throws {
+        let whole = try Array(Data(contentsOf: URL(filePath: makeSevenZip())))
+        try #require(whole.count > 120)
+        let cut = [0, whole.count / 4, whole.count / 2, whole.count - 30, whole.count]
+        var pieces: [String] = []
+        for number in 1..<cut.count {
+            pieces.append(try scratch.write(Array(whole[cut[number - 1]..<cut[number]]), as: "cut.7z.00\(number)"))
+        }
+        let index = try ArchiveIndex.read(at: pieces[0])
+        #expect(index.format == .sevenZip)
+        let files = Dictionary(uniqueKeysWithValues: index.entries.filter { $0.isFolder == false }.map { ($0.path, $0.size) })
+        #expect(files == ["source/first.txt": 70_000, "source/sub/second été.txt": 123, "source/sub/empty.txt": 0])
+        #expect(index.parts == pieces)
+        #expect(index.isWhole)
+    }
+
     @Test func theLibraryIsThere() {
         #expect(SystemArchiveLibrary.shared != nil, "macOS's libarchive couldn't be loaded: 7z archives get no total")
     }

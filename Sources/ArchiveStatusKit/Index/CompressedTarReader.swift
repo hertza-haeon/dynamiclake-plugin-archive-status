@@ -37,12 +37,22 @@ enum CompressedTarReader {
     }
 
     static func read(path: String) throws(IndexError) -> ArchiveIndex {
+        try read(paths: [path])
+    }
+
+    /// `paths`: the archive, or its pieces in order when it is cut into
+    /// several.
+    static func read(paths: [String]) throws(IndexError) -> ArchiveIndex {
         let start = ContinuousClock.now
-        return try read(path: path, isOverdue: { ContinuousClock.now - start > patience })
+        return try read(paths: paths, isOverdue: { ContinuousClock.now - start > patience })
     }
 
     /// `isOverdue` says whether the reading has taken too long.
     static func read(path: String, isOverdue: () -> Bool) throws(IndexError) -> ArchiveIndex {
+        try read(paths: [path], isOverdue: isOverdue)
+    }
+
+    static func read(paths: [String], isOverdue: () -> Bool) throws(IndexError) -> ArchiveIndex {
         guard let library = SystemArchiveLibrary.shared, let archive = library.readNew() else { throw .unreadable }
         defer { _ = library.readFree(archive) }
         // (Anything but "ok" would mean the library has no decompressor of
@@ -50,8 +60,8 @@ enum CompressedTarReader {
         let ok = SystemArchiveLibrary.ok
         guard library.supportTar(archive) == ok, library.supportGzip(archive) == ok,
               library.supportBzip2(archive) == ok, library.supportXz(archive) == ok else { throw .unreadable }
-        guard library.openFilename(archive, path, 64 * 1024) == ok else {
-            throw FileSource.isReadable(path) ? .notAnArchive : .unreadable
+        guard library.open(archive, paths) == ok else {
+            throw paths.allSatisfy(FileSource.isReadable) ? .notAnArchive : .unreadable
         }
 
         var entries: [ArchiveEntry] = []
@@ -89,7 +99,7 @@ enum CompressedTarReader {
                 if pieces % piecesBetweenChecks == 0, isOverdue() { throw .tooLarge }
             }
         }
-        return ArchiveIndex(format: .compressedTar, entries: entries, parts: [path], isWhole: isWhole)
+        return ArchiveIndex(format: .compressedTar, entries: entries, parts: paths, isWhole: isWhole)
     }
 
     /// One item as the index keeps it; nothing for what it leaves out.

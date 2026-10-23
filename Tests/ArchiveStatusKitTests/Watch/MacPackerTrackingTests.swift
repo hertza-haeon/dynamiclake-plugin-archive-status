@@ -177,10 +177,11 @@ struct MacPackerTrackingTests {
         #expect(tracker.extractions.isEmpty)
     }
 
-    /// A tar isn't read just because MacPacker has it open: that can take
-    /// seconds. It begins with the first file caught, as before.
-    @Test(arguments: ["/Users/me/Downloads/sources.tar", "/Users/me/Downloads/sources.tar.gz", "/Users/me/Downloads/sources.tgz"])
-    func aTarIsNotReadBeforeAFileOfItIsCaught(tar: String) {
+    /// A compressed tar isn't read just because MacPacker has it open: it
+    /// has to be unpacked for that, which can take seconds. It begins with
+    /// the first file caught, as before.
+    @Test(arguments: ["/Users/me/Downloads/sources.tar.gz", "/Users/me/Downloads/sources.tgz"])
+    func aCompressedTarIsNotReadBeforeAFileOfItIsCaught(tar: String) {
         mac.setIndex([ArchiveEntry(path: "src/main.c", size: 100)], format: .tar, for: tar)
         mac.put(.file(size: 100), at: "/Users/me/Downloads/src/main.c")
         var tracker = mac.tracker()
@@ -189,6 +190,30 @@ struct MacPackerTrackingTests {
         }
         #expect(mac.indexReads.isEmpty)
         #expect(tracker.extractions.isEmpty)
+    }
+
+    /// Seen on a real Mac, 13 Oct 2026: a tar of 60,000 files extracted
+    /// with MacPacker showed its pill at 65 % (the first file caught was
+    /// the 39,574th). A plain tar's list is its every header: it is read
+    /// once MacPacker keeps the tar open, and the beginning is then told
+    /// by its first files, as for a zip.
+    @Test func aPlainTarIsReadOnceMacPackerKeepsItOpenAndBeginsWithItsFirstFiles() throws {
+        let tar = "/Users/me/Downloads/sources.tar"
+        mac.setIndex([ArchiveEntry(path: "src/main.c", size: 100), ArchiveEntry(path: "src/util.c", size: 300)],
+                     format: .tar, for: tar)
+        var tracker = mac.tracker()
+        #expect(tracker.step(now: 0, processes: [macPacker([reading(tar)])]).isEmpty)
+        #expect(mac.indexReads.isEmpty, "not for a look into it")
+        #expect(tracker.step(now: 0.1, processes: [macPacker([reading(tar)])]).isEmpty)
+        #expect(mac.indexReads == [tar])
+        #expect(tracker.extractions.isEmpty)
+        // Its first file is there, and none was caught being written.
+        mac.put(.file(size: 100), at: "/Users/me/Downloads/src/main.c")
+        let lines = tracker.step(now: 2, processes: [macPacker([reading(tar)])])
+        #expect(lines.first == "sources.tar: MacPacker is extracting it: 400 bytes in 2 files (tar), into /Users/me/Downloads")
+        let extraction = try #require(tracker.extractions.first)
+        #expect(extraction.startedAt == 2)
+        #expect(extraction.written == 100)
     }
 
     @Test func theWaitForAPasswordIsNoExtraction() {
@@ -497,7 +522,7 @@ struct MacPackerTrackingTests {
         }
         let lines = tracker.step(now: 9, processes: [macPacker([])])
         #expect(lines.last == "big.rar: not complete after 9.0 s: 47 of its 1,000 files are missing or cut short; at /d/many")
-        #expect(tracker.ended.last?.ending == .stopped)
+        #expect(tracker.ended.last?.ending == .incomplete)
     }
 
     @Test func aFileCutShortInTheMiddleIsNotComplete() throws {

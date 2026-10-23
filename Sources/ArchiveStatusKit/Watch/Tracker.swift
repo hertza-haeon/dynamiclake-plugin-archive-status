@@ -36,6 +36,14 @@ public struct Surroundings: Sendable {
     public var wallClock: @Sendable () -> Double
     /// Reads an archive's index.
     public var readIndex: @Sendable (String) -> Result<ArchiveIndex, IndexError>
+    /// Starts reading, beside the plugin's loop, the list of a compressed
+    /// tar that takes too long to read within a look.
+    public var beginLaterIndex: @Sendable (String) -> Void
+    /// That list once it is read, or why it couldn't be; nothing while the
+    /// reading goes on.
+    public var laterIndex: @Sendable (String) -> Result<ArchiveIndex, IndexError>?
+    /// Gives that reading up.
+    public var dropLaterIndex: @Sendable (String) -> Void
     /// The user's home folder.
     public var home: String
 
@@ -43,11 +51,17 @@ public struct Surroundings: Sendable {
                 changeTime: @escaping @Sendable (String) -> Double?,
                 wallClock: @escaping @Sendable () -> Double,
                 readIndex: @escaping @Sendable (String) -> Result<ArchiveIndex, IndexError>,
+                beginLaterIndex: @escaping @Sendable (String) -> Void = { _ in },
+                laterIndex: @escaping @Sendable (String) -> Result<ArchiveIndex, IndexError>? = { _ in nil },
+                dropLaterIndex: @escaping @Sendable (String) -> Void = { _ in },
                 home: String) {
         self.fileState = fileState
         self.changeTime = changeTime
         self.wallClock = wallClock
         self.readIndex = readIndex
+        self.beginLaterIndex = beginLaterIndex
+        self.laterIndex = laterIndex
+        self.dropLaterIndex = dropLaterIndex
         self.home = home
     }
 
@@ -77,6 +91,9 @@ public struct Surroundings: Sendable {
             readIndex: { path in
                 Result { () throws(IndexError) in try ArchiveIndex.read(at: path) }
             },
+            beginLaterIndex: { LaterIndexes.shared.begin($0) },
+            laterIndex: { LaterIndexes.shared.result($0) },
+            dropLaterIndex: { LaterIndexes.shared.drop($0) },
             home: NSHomeDirectory())
     }
 }
@@ -89,6 +106,14 @@ public struct Extraction: Sendable {
         /// It stopped short: cancelled, or failed. From outside the two
         /// look the same.
         case stopped
+        /// The tool went through the archive to its end and put in place
+        /// what it could read, and not every file is there, whole: a
+        /// damaged archive. The card says `Incomplete`.
+        case incomplete
+        /// It ended with its result put in place, and the files of that
+        /// result couldn't be looked at: the archive's list of contents
+        /// wasn't to be had. The card says `Done`, not `Complete`.
+        case unchecked
         /// It ended, and whether it got to its end can't be told.
         case unknown
     }
@@ -213,6 +238,22 @@ public struct Tracker: Sendable {
     /// An extraction under way that writes nothing for this long is
     /// stalled, in seconds.
     static let stallSeconds = 15.0
+    /// How long the end of an extraction waits for its archive's list of
+    /// contents, when that is still being read beside the loop and the
+    /// result is in place, in seconds. Past it the card says `Done`.
+    static let listWait = 20.0
+    /// How long a compressed tar's list may take to read within a look
+    /// (`CompressedTarReader.patience`), in seconds.
+    static let lookPatience = 3.0
+    /// How many names of items at the top of a work folder are kept.
+    static let topsKept = 8
+    /// Without an index, a tool that let go of an archive with more than
+    /// this part of it unread (a twentieth) didn't get to its end.
+    static let farFromTheEnd: UInt64 = 20
+    /// How long The Unarchiver is given to put its result in place, once
+    /// it has let go of an archive none of whose files was seen being
+    /// written, in seconds.
+    static let unarchiverFinishWait = 2.0
     /// Without an index, the tool counts as having read the archive to its
     /// end when no more than this is left of it, in bytes, or a hundredth
     /// of it: a tar ends in empty blocks that needn't be read.
@@ -236,6 +277,12 @@ public struct Tracker: Sendable {
     /// with it, or until the others it was given are done too): not to be
     /// taken for another extraction.
     private var overAndStillOpen: Set<Key> = []
+    /// The archives whose list is being read beside the loop, or was.
+    private var laterBegun: Set<String> = []
+    /// Since when each is, on the Mac's clock.
+    private var laterSince: [String: Double] = [:]
+    /// The unarchivers' programs running at this look.
+    private var running: Set<Int32> = []
     private var nextID = 1
 
     public init(surroundings: Surroundings = .live) {
@@ -254,6 +301,9 @@ public struct Tracker: Sendable {
 
     private enum IndexState {
         case unread
+        /// Too long to read within a look (a large compressed tar): it is
+        /// being read beside the loop (`Surroundings.beginLaterIndex`).
+        case reading
         case read(IndexLookup)
         case failed(IndexError)
     }
@@ -297,6 +347,24 @@ public struct Tracker: Sendable {
         /// the result will go (`.TheUnarchiverTemp0`, `photos.kextraction`).
         /// When it is gone, the extraction is over.
         var work: String?
+        /// The archive's list of contents when it came too late to follow
+        /// the extraction by (it had begun without one): the files are
+        /// still looked at by it at the end.
+        var lateLookup: IndexLookup?
+        /// Whether reading the index within a look was tried.
+        var triedAtOnce = false
+        /// Since when, on the Mac's clock, the end waits for that list:
+        /// the tool's work folder is gone.
+        var listAwaitedSince: Double?
+        /// The Unarchiver writing in place (set never to make a folder):
+        /// the items at the top of the archive whose name was taken where
+        /// they go, with the numbered name each was given instead
+        /// (`album` as `album-1`).
+        var numberedTops: [String: String] = [:]
+        /// Without an index: the items at the top of what the tool was
+        /// seen to write in its work folder. The result will have one of
+        /// their names, or the archive's.
+        var topsSeen: [String] = []
         /// When the tool was first seen without the archive, while the
         /// ending is still being worked out.
         var closedSince: Double?
@@ -325,6 +393,8 @@ public struct Tracker: Sendable {
         var lines: [String] = []
         var open: Set<Key> = []
         var unreadable: Set<Int32> = []
+        running = Set(processes.map(\.pid))
+        takeLaterIndexes(lines: &lines)
 
         for process in processes {
             guard let files = process.files else {
@@ -340,6 +410,14 @@ public struct Tracker: Sendable {
             close(key, now: now, lines: &lines)
         }
         overAndStillOpen.formIntersection(open)
+        // A list nobody waits for any more isn't read on: its archive is
+        // let go of, and no tool keeps a copy of it to extract from later.
+        for path in laterBegun where watched.keys.contains(where: { $0.archive == path }) == false
+            && copies.values.contains(where: { $0.contains { $0.archive == path } }) == false {
+            surroundings.dropLaterIndex(path)
+            laterBegun.remove(path)
+            laterSince[path] = nil
+        }
         // A program that is gone takes its copies with it.
         if copies.isEmpty == false {
             let running = Set(processes.map(\.pid))
@@ -358,16 +436,19 @@ public struct Tracker: Sendable {
         let writes = files.filter(\.isWritable)
         noteCopies(of: process, reads: reads, writes: writes)
 
-        // 1. The archives it has open. The parts of a multi-part RAR are
-        //    one archive, known by its first part; the tool's own copy of
-        //    an archive goes by that archive.
+        // 1. The archives it has open. The parts of an archive in several
+        //    parts are one archive, known by one of them
+        //    (`ArchiveName.archive`); the tool's own copy of an archive
+        //    goes by that archive.
         let known = copies[process.pid] ?? []
         var sources: [(archive: String, file: OpenFile, isCopy: Bool)] = []
         for file in reads {
             if let origin = known.last(where: { $0.copy == file.path })?.archive {
                 sources.append((origin, file, true))
             } else if ArchiveName.isArchive(file.path), ArchiveName.isInTrash(file.path) == false {
-                sources.append((RarVolumeName.firstPart(of: file.path), file, false))
+                sources.append((ArchiveName.archive(of: file.path), file, false))
+            } else if isExtractedWhateverItsName(file.path, by: tool, reads: reads, writes: writes) {
+                sources.append((file.path, file, false))
             }
         }
         for source in sources {
@@ -383,6 +464,14 @@ public struct Tracker: Sendable {
             }
             if watched[key] == nil {
                 watched[key] = Watched(tool: tool, seenAt: surroundings.wallClock())
+                // Its list may be read already, or being read, beside the
+                // loop: MacPacker lets go of a compressed tar once it has
+                // unpacked it into its copy, and has it again, through
+                // that copy, when asked to extract.
+                if laterBegun.contains(key.archive) {
+                    watched[key]?.index = .reading
+                    takeLaterIndex(key, lines: &lines)
+                }
             }
             if source.isCopy {
                 watched[key]?.copy = source.file.path
@@ -407,7 +496,23 @@ public struct Tracker: Sendable {
             .filter { $0.pid == process.pid && (open.contains($0) || watched[$0]?.extraction != nil) }
             .sorted()
         // (Readings are only taken of archives being followed.)
-        guard keys.isEmpty == false else { return }
+        guard keys.isEmpty == false else {
+            // One of Keka's helpers with no archive of its own may write
+            // for another's: it is handed what that one unpacks (a
+            // `tar.zst`: one helper reads the archive, another writes the
+            // files). What it writes into an archive's work folder is
+            // that archive's.
+            if tool == .keka {
+                for write in writes where counts(write.path, for: tool) {
+                    guard let work = tool.workFolder(of: write.path),
+                          let owner = watched.keys.sorted().first(where: {
+                              watched[$0]?.tool == .keka && watched[$0]?.work == work && watched[$0]?.lookup == nil
+                          }), countsWithoutIndex(write.path, for: tool) else { continue }
+                    noteUnlisted(write, key: owner, now: now, lines: &lines)
+                }
+            }
+            return
+        }
 
         // 2. The indexes. Archive Utility's helper has an archive open only
         //    to extract it. MacPacker also has it open to show what is in
@@ -415,7 +520,7 @@ public struct Tracker: Sendable {
         let counted = writes.filter { counts($0.path, for: tool) }
         if tool.opensOnlyToExtract || counted.isEmpty == false {
             for key in keys {
-                now += readIndexIfNeeded(key)
+                now += readIndexIfNeeded(key, thoughBeingRead: tool == .macPacker)
             }
         }
         // An archive in a tool's queue is known from the moment the tool
@@ -445,13 +550,25 @@ public struct Tracker: Sendable {
         // (An archive MacPacker keeps open past one look is read all the
         // same, to find the extraction's beginning without waiting for a
         // file to be caught: `findBeginning`. Not one it had open for a
-        // moment, to list it; and not a tar, whose reading can take
-        // seconds.)
+        // moment, to list it. A plain tar is read too, though its list
+        // is its every header and takes longer (0.8 s for 60,000 files,
+        // on a real Mac, 13 Oct 2026): without it the pill came when two
+        // thirds of such a tar were extracted. Not a compressed tar, which
+        // has to be unpacked to be read.)
         if tool == .macPacker {
             for key in keys where open.contains(key) && watched[key]?.extraction == nil {
                 watched[key]?.looks += 1
-                if let entry = watched[key], entry.looks >= 2, entry.copy == nil, ArchiveName.hasIndex(key.archive) {
+                if let entry = watched[key], entry.looks >= 2, entry.copy == nil,
+                   ArchiveName.hasIndex(key.archive) || ArchiveName.isPlainTar(key.archive) {
                     now += readIndexIfNeeded(key)
+                }
+                // A compressed tar is read too, beside the loop: MacPacker
+                // unpacks it into a copy of its own before it can extract
+                // anything of it, and the plugin can't read that copy. (On
+                // a real Mac, 13 Oct 2026: with no list, the extraction
+                // from the copy came and went in one look.)
+                if let entry = watched[key], entry.looks >= 2, ArchiveName.isCompressed(key.archive) {
+                    readIndexBesideTheLoop(key)
                 }
             }
         }
@@ -467,6 +584,13 @@ public struct Tracker: Sendable {
             }
             if let best = owner(among: listed, of: keys.count) {
                 note(write, match: best.match, key: best.key, now: now, lines: &lines)
+            } else if tool == .theUnarchiver, tool.workFolder(of: write.path) == nil,
+                      let numbered = numberedOwner(of: write.path, among: keys) {
+                // Written in place under a name with a number: its item's
+                // own name was taken there.
+                watched[numbered.key]?.numberedTops[numbered.top] = numbered.onDisk
+                note(write, match: numbered.match, key: numbered.key, now: now, lines: &lines)
+                showNumberedTops(numbered.key, root: numbered.match.root)
             } else if let key = unlistedOwner(of: write.path, among: keys), countsWithoutIndex(write.path, for: tool) {
                 noteUnlisted(write, key: key, now: now, lines: &lines)
             }
@@ -502,11 +626,13 @@ public struct Tracker: Sendable {
     /// Remembers the copy a tool is making of a compressed archive: the
     /// file it writes among its own while it reads the archive, and no
     /// other like it. What is extracted from the copy later, under a name
-    /// that says nothing, is then known to be that archive's.
+    /// that says nothing, is then known to be that archive's. An archive
+    /// cut into numbered pieces is unpacked with every piece open: the
+    /// pieces are one archive, known by the first.
     private mutating func noteCopies(of process: ToolProcess, reads: [OpenFile], writes: [OpenFile]) {
         let made = writes.filter { process.tool.keepsCopy(at: $0.path) }
         guard made.isEmpty == false else { return }
-        let origins = Set(reads.map(\.path).filter(ArchiveName.isCompressed))
+        let origins = Set(reads.map(\.path).filter(ArchiveName.isCompressed).map(ArchiveName.archive(of:)))
         guard origins.count == 1, let origin = origins.first else { return }
         var known = copies[process.pid] ?? []
         for copy in made where known.contains(where: { $0.copy == copy.path }) == false {
@@ -563,6 +689,85 @@ public struct Tracker: Sendable {
         return fresh.count == 1 ? fresh.first : nil
     }
 
+    /// The archive a file belongs to when the item at the top of its path
+    /// carries a number its archive doesn't know (`album-1/a.jpg`): the
+    /// first whose index lists it without that number, written where that
+    /// extraction writes if it has begun.
+    private func numberedOwner(of path: String, among keys: [Key])
+        -> (key: Key, match: IndexLookup.Match, top: String, onDisk: String)? {
+        for key in keys {
+            guard let entry = watched[key], let lookup = entry.lookup,
+                  let found = lookup.matchNumberedTop(path, notBefore: entry.place) else { continue }
+            if let place = entry.extraction?.destination, entry.extraction?.isWaiting == false, place != found.match.root { continue }
+            return (key, found.match, found.top, found.onDisk)
+        }
+        return nil
+    }
+
+    /// Where an item of the archive is, under the folder the archive is
+    /// extracted into: its path there, with the numbered name its top item
+    /// was given if that one's own was taken.
+    private static func onDisk(_ path: String, in root: String, tops: [String: String]) -> String {
+        guard tops.isEmpty == false else { return join(root, path) }
+        let slash = path.firstIndex(of: "/") ?? path.endIndex
+        guard let given = tops[String(path[..<slash])] else { return join(root, path) }
+        return join(root, given + path[slash...])
+    }
+
+    /// What Show in Finder shows of an extraction written in place, with
+    /// the numbered names known so far.
+    private mutating func showNumberedTops(_ key: Key, root: String) {
+        guard let entry = watched[key], let lookup = entry.lookup else { return }
+        let left = Self.leftBehind(in: root, index: lookup.index, tops: entry.numberedTops)
+        watched[key]?.extraction?.result = left.result
+        watched[key]?.extraction?.revealPaths = left.reveal
+    }
+
+    /// The numbered names of the top items no file of which was caught
+    /// being written: for each, its own name if that was written by this
+    /// extraction, else the first numbered one that was.
+    private func allNumberedTops(_ entry: Watched, lookup: IndexLookup, root: String,
+                                 numberedBy tool: Tool = .theUnarchiver) -> [String: String] {
+        var tops = entry.numberedTops
+        var seen: Set<String> = []
+        for item in lookup.index.entries {
+            let path = item.path
+            let slash = path.firstIndex(of: "/") ?? path.endIndex
+            let top = String(path[..<slash])
+            guard seen.insert(top).inserted, tops[top] == nil else { continue }
+            let isFolder = slash != path.endIndex || item.isFolder
+            for name in Self.numbered(top, isFolder: isFolder, by: tool, in: root) {
+                guard let changed = surroundings.changeTime(name) else { break }       // (the first free name: not there)
+                if changed >= entry.seenAt - Self.writtenMargin {
+                    if name != Self.join(root, top) { tops[top] = ArchiveName.fileName(of: name) }
+                    break
+                }
+            }
+        }
+        return tops
+    }
+
+    /// Whether a file a tool reads is an archive it extracts, though its
+    /// name doesn't say so (`comic.cbx`, `backup.tar.zst`, `disc.iso`):
+    /// one of the user's own files, read by a tool that reads nothing else
+    /// of theirs.
+    ///
+    /// The Unarchiver only extracts. Keka's helpers compress too, reading
+    /// whatever they compress: one of them extracts the file when Keka
+    /// has made the folder it works in for it (`backup.tar.kextraction`,
+    /// beside it), or when it reads that file alone and writes into such a
+    /// folder.
+    private func isExtractedWhateverItsName(_ path: String, by tool: Tool, reads: [OpenFile], writes: [OpenFile]) -> Bool {
+        guard tool.extractsWhateverItsName, ArchiveName.isUsersOwn(path, home: surroundings.home),
+              ArchiveName.isInTrash(path) == false, tool.workFolder(of: path) == nil else { return false }
+        guard tool == .keka else { return true }
+        if case .folder = surroundings.fileState(Tool.kekaWorkFolder(for: path)) { return true }
+        let own = reads.filter {
+            ArchiveName.isUsersOwn($0.path, home: surroundings.home) && tool.workFolder(of: $0.path) == nil
+        }
+        return own.count == 1 && writes.contains { tool.workFolder(of: $0.path) != nil }
+    }
+
     /// Whether another of the tool's programs is already taken to extract
     /// this archive.
     private func isExtracted(_ archive: String, byAnotherThan key: Key) -> Bool {
@@ -582,7 +787,10 @@ public struct Tracker: Sendable {
         case .archiveUtility:
             true
         case .macPacker, .theUnarchiver:
-            path.hasPrefix(surroundings.home + "/Library/") == false
+            // (Not their own files in the user's Library; what is written
+            // into iCloud Drive or a cloud disk, which macOS keeps there
+            // too, is the user's.)
+            ArchiveName.isInOwnLibrary(path, home: surroundings.home) == false
                 && path.hasPrefix("/private/var/folders/") == false
                 && path.hasPrefix("/var/folders/") == false
         case .keka:
@@ -614,17 +822,113 @@ public struct Tracker: Sendable {
     /// a real Mac, 12 Oct: counted as time spent extracting, it made
     /// the first speed a twentieth of the true one, and the extraction
     /// expected to take 475 s.)
-    private mutating func readIndexIfNeeded(_ key: Key) -> Double {
-        guard var entry = watched[key], case .unread = entry.index else { return 0 }
+    ///
+    /// `thoughBeingRead`: also when the list is already being read beside
+    /// the loop and isn't there yet, once: an extraction has begun, and
+    /// most lists are read in a moment.
+    private mutating func readIndexIfNeeded(_ key: Key, thoughBeingRead: Bool = false) -> Double {
+        guard var entry = watched[key] else { return 0 }
+        switch entry.index {
+        case .unread: break
+        case .reading where thoughBeingRead && entry.triedAtOnce == false:
+            // (Not one that has been read beside the loop for longer than
+            // a look may last: it wouldn't be read at once either.)
+            if let since = laterSince[key.archive], surroundings.wallClock() - since > Self.lookPatience {
+                watched[key]?.triedAtOnce = true
+                return 0
+            }
+        default: return 0
+        }
+        entry.triedAtOnce = true
         let before = surroundings.wallClock()
         switch surroundings.readIndex(key.archive) {
         case .success(let index):
             entry.index = .read(IndexLookup(index))
+            if laterBegun.remove(key.archive) != nil {
+                surroundings.dropLaterIndex(key.archive)
+                laterSince[key.archive] = nil
+            }
+        case .failure(.tooLarge) where ArchiveName.isCompressed(key.archive):
+            // Too long to unpack within a look: read on beside the loop.
+            entry.index = .reading
+            if laterBegun.insert(key.archive).inserted {
+                surroundings.beginLaterIndex(key.archive)
+                laterSince[key.archive] = surroundings.wallClock()
+            }
         case .failure(let error):
             entry.index = .failed(error)
         }
         watched[key] = entry
         return min(max(0, surroundings.wallClock() - before), Self.longestIndexRead)
+    }
+
+    /// Has a compressed tar's list read beside the loop from the start,
+    /// without the wait of a first try: for one MacPacker has open, which
+    /// it unpacks into a copy of its own before anything can be extracted.
+    private mutating func readIndexBesideTheLoop(_ key: Key) {
+        guard let entry = watched[key], case .unread = entry.index else { return }
+        watched[key]?.index = .reading
+        if laterBegun.insert(key.archive).inserted {
+            surroundings.beginLaterIndex(key.archive)
+            laterSince[key.archive] = surroundings.wallClock()
+        }
+    }
+
+    /// Takes the lists that were read beside the loop since the last look.
+    ///
+    /// One that comes before its extraction has begun is the archive's
+    /// index, as if read at once. One that comes after the extraction
+    /// began without it is kept for the end: the extraction goes on being
+    /// followed by how far the archive is read, and its files are looked
+    /// at by the list once the tool is done.
+    private mutating func takeLaterIndexes(lines: inout [String]) {
+        for key in watched.keys.sorted() {
+            takeLaterIndex(key, lines: &lines)
+        }
+    }
+
+    private mutating func takeLaterIndex(_ key: Key, lines: inout [String]) {
+        do {
+            guard var entry = watched[key], case .reading = entry.index else { return }
+            let name = ArchiveName.fileName(of: key.archive)
+            switch surroundings.laterIndex(key.archive) {
+            case .success(let index)?:
+                let lookup = IndexLookup(index)
+                let what = "\(Amount.bytes(index.totalSize)) in \(files(index.fileCount)) (\(index.format.logName))"
+                if entry.extraction == nil || entry.extraction?.isWaiting == true {
+                    entry.index = .read(lookup)
+                    if entry.extraction != nil {
+                        entry.extraction?.total = index.totalSize
+                        entry.extraction?.fileCount = index.fileCount
+                        entry.extraction?.measuresArchive = false
+                        entry.extraction?.written = 0
+                    }
+                    lines.append("\(name): its list of contents is read: \(what)")
+                } else {
+                    entry.index = .failed(.tooLarge)
+                    entry.lateLookup = lookup
+                    lines.append("\(name): its list of contents is read (\(what)): its files will be looked at by it at the end")
+                }
+            case .failure(let error)?:
+                entry.index = .failed(error)
+                lines.append("\(name): its list of contents couldn't be read after all (\(reason(error)))")
+            case nil:
+                // Still being read. Once the tool's work folder is gone,
+                // the end waits for it a while (`listWait`).
+                if entry.listAwaitedSince == nil, let work = entry.work, surroundings.fileState(work) == .missing {
+                    entry.listAwaitedSince = surroundings.wallClock()
+                }
+            }
+            watched[key] = entry
+        }
+    }
+
+    /// Whether the end of this extraction still waits for its archive's
+    /// list of contents.
+    private func awaitsList(_ entry: Watched) -> Bool {
+        guard case .reading = entry.index else { return false }
+        guard let since = entry.listAwaitedSince else { return true }
+        return surroundings.wallClock() - since < Self.listWait
     }
 
     // MARK: Waiting for its turn
@@ -656,16 +960,27 @@ public struct Tracker: Sendable {
     ///
     /// The archive's first files are looked for where MacPacker puts what
     /// it extracts: beside the archive, in Downloads, where it extracted
-    /// last, and in a folder named after the archive in each of those. One
-    /// that is there, written since MacPacker opened the archive, is the
-    /// beginning. A few questions to macOS a look; no folder is listed.
+    /// last, and in a folder named after the archive in each of those; and,
+    /// for a MacPacker that extracts into a work folder, in
+    /// `<name>.macpack` in each of those places. Extracting from its copy
+    /// of a compressed tar, MacPacker names the work folder after the copy:
+    /// after the tar inside, whose name may not be the archive's
+    /// (`photos.tar.gz.001` holding `trip.tar`). One that is there, written
+    /// since MacPacker opened the archive, is the beginning. A few
+    /// questions to macOS a look; no folder is listed.
     private mutating func findBeginning(_ key: Key, now: Double, lines: inout [String]) {
         guard let entry = watched[key], entry.extraction == nil, entry.lookup != nil else { return }
-        let name = ArchiveName.baseName(of: key.archive)
+        var names = [ArchiveName.baseName(of: key.archive)]
+        if let copy = entry.copy, names.contains(ArchiveName.baseName(of: copy)) == false {
+            names.append(ArchiveName.baseName(of: copy))
+        }
+        let works = names.map { $0 + "." + Self.macPackerWorkEnding }
         var roots: [String] = []
         for base in [ArchiveName.folder(of: key.archive), Self.join(surroundings.home, "Downloads")] + recentPlaces
             + recentPlaces.map(ArchiveName.folder) where base.isEmpty == false {
-            for root in [base, Self.join(base, name)] where roots.contains(root) == false {
+            let named = names.map { Self.join(base, $0) }
+            let inWork = ([base] + named).flatMap { folder in works.map { Self.join(folder, $0) } }
+            for root in [base] + named + inWork where roots.contains(root) == false {
                 roots.append(root)
             }
         }
@@ -691,10 +1006,38 @@ public struct Tracker: Sendable {
         }
     }
 
+    // MARK: Keka's next helper
+
+    /// Keka goes at an archive it can't extract with one helper after the
+    /// other, each in the same folder (seen on a real Mac, 13 Oct 2026:
+    /// three helpers in two seconds for a `tar.gz` cut short, two for a
+    /// zip). The next one carries on the extraction the one before it
+    /// left: the same extraction, begun again, not a second one.
+    ///
+    /// Taken over: an extraction of this archive by a helper of Keka's that
+    /// is gone, whose ending isn't told yet (its folder is still there),
+    /// when this helper writes into that same folder.
+    private mutating func carryOnKekaExtraction(_ key: Key, into work: String?, lines: inout [String]) {
+        guard let entry = watched[key], entry.tool == .keka, entry.extraction == nil, let work else { return }
+        let left = watched.keys.sorted().first { other in
+            guard other != key, other.archive == key.archive, let earlier = watched[other], earlier.tool == .keka,
+                  earlier.extraction != nil, running.contains(other.pid) == false else { return false }
+            return earlier.work == nil || earlier.work == work
+        }
+        guard let left, var extraction = watched.removeValue(forKey: left)?.extraction else { return }
+        // (It keeps its number, and begins again with this helper's first
+        // file, as one that waited for its turn does.)
+        extraction.isWaiting = true
+        watched[key]?.extraction = extraction
+        watched[key]?.work = work
+        lines.append("\(extraction.name): Keka goes at it again, with another of its helpers")
+    }
+
     // MARK: A file being written
 
     private mutating func note(_ write: OpenFile, match: IndexLookup.Match, key: Key, now: Double,
                                lines: inout [String]) {
+        carryOnKekaExtraction(key, into: watched[key]?.tool.workFolder(of: write.path), lines: &lines)
         guard var entry = watched[key], let lookup = entry.lookup else { return }
         if entry.extraction == nil || entry.extraction?.isWaiting == true {
             // (One that waited keeps its number: it begins now.)
@@ -739,6 +1082,7 @@ public struct Tracker: Sendable {
     }
 
     private mutating func noteUnlisted(_ write: OpenFile, key: Key, now: Double, lines: inout [String]) {
+        carryOnKekaExtraction(key, into: watched[key]?.tool.workFolder(of: write.path), lines: &lines)
         guard var entry = watched[key] else { return }
         if entry.extraction == nil || entry.extraction?.isWaiting == true {
             var extraction = Extraction(id: entry.extraction?.id ?? takeID(), tool: entry.tool, archivePath: key.archive,
@@ -755,6 +1099,9 @@ public struct Tracker: Sendable {
             if case .failed(let error) = entry.index {
                 why = reason(error)
             }
+            if case .reading = entry.index {
+                why = "it takes long to read: its list is being read meanwhile"
+            }
             if followReading(&entry) {
                 lines.append("\(extraction.name): \(entry.tool.displayName) is extracting it; no total to read (\(why)), "
                              + "so it is followed by how far \(Self.whatIsRead(entry)) has been read, "
@@ -762,6 +1109,10 @@ public struct Tracker: Sendable {
             } else {
                 lines.append("\(extraction.name): \(entry.tool.displayName) is extracting it; total unknown (\(why))")
             }
+        }
+        for top in Self.tops(of: write.path, for: entry.tool, archivePath: key.archive)
+        where entry.topsSeen.contains(top) == false && entry.topsSeen.count < Self.topsKept {
+            entry.topsSeen.append(top)
         }
         // One file at a time: when another file is being written, the one
         // before is taken as done at the size last seen.
@@ -891,7 +1242,7 @@ public struct Tracker: Sendable {
             // a disk that went away…).
             let quiet = now - extraction.pace.lastGrowthAt
             if extraction.stalledSince == nil, quiet >= Self.stallSeconds, isOpen, extraction.isWaiting == false,
-               Self.isAllWritten(extraction) == false {
+               entry.listAwaitedSince == nil, Self.isAllWritten(extraction) == false {
                 extraction.stalledSince = now
                 lines.append("\(extraction.name): stalled: nothing written for \(Int(Self.stallSeconds)) s"
                              + (extraction.total.map { " (at \(Amount.percent(extraction.written, of: $0)))" } ?? ""))
@@ -969,7 +1320,8 @@ public struct Tracker: Sendable {
         let files = lookup.filePlaces
         let since = entry.seenAt
         func written(_ number: Int) -> Bool {
-            number < files.count && isWritten(Self.join(root, lookup.index.entries[files[number]].path), since: since)
+            number < files.count
+                && isWritten(Self.onDisk(lookup.index.entries[files[number]].path, in: root, tops: entry.numberedTops), since: since)
         }
         /// Written, or stepped over: a file the tool left out (it does that
         /// for a name it can't write) must not hold everything up.
@@ -988,7 +1340,7 @@ public struct Tracker: Sendable {
             // it doesn't (a disk that keeps no such date), this way is off.
             // (Should the file not be found at all, it is tried again at
             // the next look.)
-            let caughtPath = Self.join(root, lookup.index.entries[files[caught]].path)
+            let caughtPath = Self.onDisk(lookup.index.entries[files[caught]].path, in: root, tops: entry.numberedTops)
             guard surroundings.changeTime(caughtPath) != nil else { return nil }
             guard written(caught) else {
                 entry.probing = .off
@@ -1027,7 +1379,7 @@ public struct Tracker: Sendable {
 
         let place = files[furthest]
         guard place >= entry.place else { return nil }
-        let path = Self.join(root, lookup.index.entries[place].path)
+        let path = Self.onDisk(lookup.index.entries[place].path, in: root, tops: entry.numberedTops)
         var size: UInt64 = 0
         if case .file(let onDisk) = surroundings.fileState(path) { size = onDisk }
         entry.place = place
@@ -1045,6 +1397,27 @@ public struct Tracker: Sendable {
     private mutating func close(_ key: Key, now: Double, lines: inout [String]) {
         guard var entry = watched[key] else { return }
         guard entry.extraction != nil else {
+            // MacPacker extracts from its copy of a compressed tar in less
+            // than a second, when the files are few: all of it may happen
+            // between two looks, or before the archive's list is read
+            // (seen on a real Mac, 13 Oct 2026: done four seconds before
+            // the list was there). The list is waited for a while, then
+            // the archive's first files are looked for where MacPacker
+            // puts them; found, the extraction is taken up from there.
+            if entry.tool == .macPacker, entry.copy != nil {
+                if case .reading = entry.index {
+                    entry.closedSince = entry.closedSince ?? now
+                    entry.listAwaitedSince = entry.listAwaitedSince ?? surroundings.wallClock()
+                    watched[key] = entry
+                    if awaitsList(entry) { return }
+                } else if entry.lookup != nil {
+                    findBeginning(key, now: now, lines: &lines)
+                    if watched[key]?.extraction != nil {
+                        watched[key]?.closedSince = entry.closedSince ?? now
+                        return                           // (settled at the next look)
+                    }
+                }
+            }
             // Nothing was written: it was only looked into, or the wait for
             // a password. No extraction to speak of.
             watched[key] = nil
@@ -1063,6 +1436,33 @@ public struct Tracker: Sendable {
                     return
                 }
             }
+            // The Unarchiver may have done all its work between two looks
+            // (seen on a real Mac, 13 Oct 2026: a `tar.gz` extracted
+            // while the lists of others were being read): what it left
+            // where the archive is tells, and it is given a moment to put
+            // it there.
+            if entry.tool == .theUnarchiver {
+                let since = entry.closedSince ?? now
+                entry.closedSince = since
+                watched[key] = entry
+                if let end = resultEnding(entry, key: key, in: ArchiveName.folder(of: key.archive)) {
+                    watched[key]?.extraction?.isWaiting = false
+                    settle(key, as: end, now: now, lines: &lines)
+                    return
+                }
+                // Set never to make a folder, it writes several items each
+                // at its final place, under a numbered name where its own
+                // is taken: looked for there too.
+                if let end = inPlaceEnding(entry, in: ArchiveName.folder(of: key.archive)) {
+                    watched[key]?.extraction?.isWaiting = false
+                    watched[key]?.extraction?.destination = ArchiveName.folder(of: key.archive)
+                    watched[key]?.numberedTops = end.tops
+                    showNumberedTops(key, root: ArchiveName.folder(of: key.archive))
+                    finish(key, as: end.ending, note: end.note, now: now, lines: &lines)
+                    return
+                }
+                if now - since < Self.unarchiverFinishWait { return }
+            }
             // It waited for its turn and the tool let go of it: never begun.
             watched[key] = nil
             lines.append("\(ArchiveName.fileName(of: key.archive)): let go of without being extracted")
@@ -1074,6 +1474,51 @@ public struct Tracker: Sendable {
         if entry.lastWriteAt == now { return }
         switch entry.tool {
         case .macPacker:
+            // Followed without its list, which is still being read beside
+            // the loop: the end waits for it, to look at the files by.
+            if case .reading = entry.index {
+                entry.closedSince = entry.closedSince ?? now
+                entry.listAwaitedSince = entry.listAwaitedSince ?? surroundings.wallClock()
+                watched[key] = entry
+                if awaitsList(entry) { return }
+            }
+            // The list came after the extraction had begun: the place it
+            // went to is told by the file last seen being written.
+            if entry.lookup == nil, let late = entry.lateLookup, let current = entry.current,
+               let match = late.match(current.path) {
+                entry.index = .read(late)
+                entry.extraction?.destination = match.root
+                let left = Self.leftBehind(in: match.root, index: late.index)
+                entry.extraction?.result = left.result
+                entry.extraction?.revealPaths = left.reveal
+                watched[key] = entry
+            }
+            // Extracted into a work folder: the result is looked at where
+            // MacPacker put it once that folder is gone.
+            if let work = Self.macPackerWorkFolder(of: entry.extraction?.destination) {
+                let since = entry.closedSince ?? now
+                entry.closedSince = since
+                watched[key] = entry
+                if surroundings.fileState(work) != .missing {
+                    // MacPacker puts the result in place right after it
+                    // lets go of the archive: a rename or a few. Still
+                    // there past the wait, it never will: quit mid-way.
+                    if now - since < Self.unarchiverFinishWait { return }
+                    finish(key, as: .stopped, note: nil, now: now, lines: &lines)
+                    return
+                }
+                guard let placed = macPackerPlacedResult(entry, key: key, work: work) else {
+                    // Gone with nothing put in place: cancelled, or it
+                    // failed, and MacPacker took its work folder away.
+                    finish(key, as: .stopped, note: nil, now: now, lines: &lines)
+                    return
+                }
+                entry.extraction?.destination = placed.root
+                entry.numberedTops = placed.tops
+                watched[key] = entry
+                showNumberedTops(key, root: placed.root)
+                entry = watched[key] ?? entry
+            }
             let end = macPackerEnding(entry)
             finish(key, as: end.ending, note: end.note, now: now, lines: &lines)
         case .archiveUtility:
@@ -1087,10 +1532,20 @@ public struct Tracker: Sendable {
             }
         case .theUnarchiver where Self.writesInPlace(entry):
             // (No work folder: it wrote at the final place, and is judged
-            // as MacPacker is.)
+            // as MacPacker is. Where a name was taken there, the items no
+            // file of which was caught are looked for under numbered ones.)
+            if entry.numberedTops.isEmpty == false, let lookup = entry.lookup, let root = entry.extraction?.destination {
+                entry.numberedTops = allNumberedTops(entry, lookup: lookup, root: root)
+                watched[key] = entry
+                showNumberedTops(key, root: root)
+                entry = watched[key] ?? entry
+            }
             let end = macPackerEnding(entry)
             finish(key, as: end.ending, note: end.note, now: now, lines: &lines)
         case .theUnarchiver:
+            // (Its result is in place and the list to look at its files by
+            // is still being read: not the end yet.)
+            if isHeldForList(entry, key: key) { return }
             // (Let go of with its work folder still there: it didn't get
             // to its end. The program was quit, say.)
             let end = besideEnding(entry, key: key) ?? (.stopped, nil, nil)
@@ -1106,6 +1561,23 @@ public struct Tracker: Sendable {
                 settle(key, as: end, now: now, lines: &lines)
             }
         }
+    }
+
+    /// What The Unarchiver left of an archive none of whose files was seen
+    /// being written, when it wrote them where they are to stay, in
+    /// `root`: each item at the top under its own name or a numbered one,
+    /// written by this extraction. Nothing when the archive's last file
+    /// isn't there from this extraction.
+    private func inPlaceEnding(_ entry: Watched, in root: String)
+        -> (ending: Extraction.Ending, note: String?, tops: [String: String])? {
+        guard let lookup = entry.lookup, let last = lookup.lastSizedPlace else { return nil }
+        let tops = allNumberedTops(entry, lookup: lookup, root: root)
+        let item = lookup.index.entries[last]
+        let path = Self.onDisk(item.path, in: root, tops: tops)
+        guard case .file = surroundings.fileState(path), let changed = surroundings.changeTime(path),
+              changed >= entry.seenAt - Self.writtenMargin else { return nil }
+        let lacking = filesLacking(lookup, since: nil) { Self.onDisk($0, in: root, tops: tops) }
+        return lacking > 0 ? (.incomplete, Self.lackingNote(lacking, of: lookup), tops) : (.complete, nil, tops)
     }
 
     /// Whether the tool writes this archive's files where they are to
@@ -1169,9 +1641,61 @@ public struct Tracker: Sendable {
         -> (ending: Extraction.Ending, note: String?, result: String?)? {
         guard let work = entry.work else { return (.unknown, nil, nil) }
         guard surroundings.fileState(work) == .missing else { return nil }
-        guard let lookup = entry.lookup else { return (.unknown, nil, nil) }
-        let expected = Self.namesBeside(of: entry.tool, archivePath: key.archive, index: lookup.index,
-                                        in: ArchiveName.folder(of: work))
+        if let end = resultEnding(entry, key: key, in: ArchiveName.folder(of: work)) {
+            // With the list still being read, the result is there to be
+            // looked at by it soon: `Done` is only said if it doesn't come.
+            return end.ending == .unchecked && awaitsList(entry) ? nil : end
+        }
+        // Nothing was put in place: stopped.
+        guard entry.lookup == nil else { return (.stopped, nil, nil) }
+        // Without an index the result may be there under a name that
+        // can't be guessed. Stopped is only said when the tool was also
+        // far from the end of the archive when it let go of it; read to
+        // its end, or its reading unknown, the end can't be told.
+        if let extraction = entry.extraction, extraction.measuresArchive, let total = extraction.total,
+           extraction.written.addingSaturating(total / Self.farFromTheEnd) < total {
+            return (.stopped, nil, nil)
+        }
+        return (.unknown, nil, nil)
+    }
+
+    /// Whether the tool is done with this extraction, its result in place,
+    /// and only the archive's list of contents is waited for, to look at
+    /// the result's files by.
+    private func isHeldForList(_ entry: Watched, key: Key) -> Bool {
+        guard awaitsList(entry), let work = entry.work, surroundings.fileState(work) == .missing else { return false }
+        return resultEnding(entry, key: key, in: ArchiveName.folder(of: work))?.ending == .unchecked
+    }
+
+    /// What The Unarchiver or Keka left in `folder` of this extraction:
+    /// its result, under one of the names it may have, with every file of
+    /// the index looked at. Nothing when no result is there.
+    ///
+    /// Without an index (it couldn't be read: the folder's access refused,
+    /// a compressed tar too long to unpack) the result is still looked
+    /// for, under the archive's name and under the names of what was seen
+    /// being written. Found, the extraction ended with its result in
+    /// place, and its files can't be looked at: `.unchecked`.
+    private func resultEnding(_ entry: Watched, key: Key, in folder: String)
+        -> (ending: Extraction.Ending, note: String?, result: String?)? {
+        guard let lookup = entry.lookup ?? entry.lateLookup else {
+            var names = Self.numbered(Self.folderName(of: entry.tool, archivePath: key.archive), isFolder: true,
+                                      by: entry.tool, in: folder)
+            for top in entry.topsSeen {
+                // (A folder or a file: both ways of numbering it.)
+                names += Self.numbered(top, isFolder: true, by: entry.tool, in: folder)
+                    + Self.numbered(top, isFolder: false, by: entry.tool, in: folder)
+            }
+            var found: (path: String, changed: Double)?
+            for name in names {
+                guard let changed = surroundings.changeTime(name), changed >= entry.seenAt - Self.writtenMargin else { continue }
+                if changed > (found?.changed ?? -.infinity) {
+                    found = (name, changed)
+                }
+            }
+            return found.map { (.unchecked, nil, $0.path) }
+        }
+        let expected = Self.namesBeside(of: entry.tool, archivePath: key.archive, index: lookup.index, in: folder)
         // Of the names the result may have, the one given since this
         // extraction began; of several, the latest.
         var found: (path: String, changed: Double)?
@@ -1181,7 +1705,7 @@ public struct Tracker: Sendable {
                 found = (name, changed)
             }
         }
-        guard let result = found?.path else { return (.stopped, nil, nil) }
+        guard let result = found?.path else { return nil }
         // The archive's one item has the result's name (it may have got a
         // number), or lies in a folder made for it, named after the
         // archive (The Unarchiver set always to make one: seen on a real
@@ -1206,7 +1730,7 @@ public struct Tracker: Sendable {
             guard let top else { return Self.join(result, path) }
             return result + path.dropFirst(top.count)
         }
-        return lacking > 0 ? (.stopped, Self.lackingNote(lacking, of: lookup), result) : (.complete, nil, result)
+        return lacking > 0 ? (.incomplete, Self.lackingNote(lacking, of: lookup), result) : (.complete, nil, result)
     }
 
     /// The names The Unarchiver or Keka may give the result in `folder`:
@@ -1220,7 +1744,7 @@ public struct Tracker: Sendable {
     static func namesBeside(of tool: Tool, archivePath: String, index: ArchiveIndex, in folder: String)
         -> (names: [String], top: String?, folderNames: [String]) {
         let tops = Set(index.entries.compactMap { $0.path.split(separator: "/").first.map(String.init) })
-        let base = ArchiveName.baseName(of: archivePath)
+        let base = folderName(of: tool, archivePath: archivePath)
         var item = base
         var isFolder = true
         var top: String?
@@ -1229,19 +1753,124 @@ public struct Tracker: Sendable {
             top = only
             isFolder = index.entries.contains { $0.path != only || $0.isFolder }
         }
-        func numbered(_ item: String, isFolder: Bool) -> [String] {
-            var stem = item
-            var ending = ""
-            if isFolder == false, let dot = item.lastIndex(of: "."), dot != item.startIndex {
-                stem = String(item[..<dot])
-                ending = String(item[dot...])
-            }
-            return (0..<resultNamesTried).map { number in
-                if number == 0 { return join(folder, item) }
-                return join(folder, tool == .keka ? "\(stem) \(number + 1)\(ending)" : "\(stem)-\(number)\(ending)")
+        return (numbered(item, isFolder: isFolder, by: tool, in: folder), top,
+                top == nil ? [] : numbered(base, isFolder: true, by: tool, in: folder))
+    }
+
+    /// An item's name in `folder`, then the names it gets when that one is
+    /// taken: `-1`, `-2`… for The Unarchiver, ` 2`, ` 3`… for Keka,
+    /// ` (2)`, ` (3)`… for MacPacker, a file's number before its extension.
+    static func numbered(_ item: String, isFolder: Bool, by tool: Tool, in folder: String) -> [String] {
+        var stem = item
+        var ending = ""
+        if isFolder == false, let dot = item.lastIndex(of: "."), dot != item.startIndex {
+            stem = String(item[..<dot])
+            ending = String(item[dot...])
+        }
+        return (0..<resultNamesTried).map { number in
+            if number == 0 { return join(folder, item) }
+            switch tool {
+            case .keka: return join(folder, "\(stem) \(number + 1)\(ending)")
+            case .macPacker: return join(folder, "\(stem) (\(number + 1))\(ending)")
+            default: return join(folder, "\(stem)-\(number)\(ending)")
             }
         }
-        return (numbered(item, isFolder: isFolder), top, top == nil ? [] : numbered(base, isFolder: true))
+    }
+
+    /// The item at the top of a tool's work folder that a file written
+    /// there is, or is in: `photos` for
+    /// `…/.TheUnarchiverTemp0/photos/a.jpg` and for
+    /// `…/photos.kextraction/Operation/photos/a.jpg`.
+    static func top(of path: String, for tool: Tool) -> String? {
+        inside(path, for: tool)?.first.map(String.init)
+    }
+
+    /// The names the result may have, from a file seen being written in
+    /// the tool's work folder: the item at the top of that folder, and,
+    /// when that one is a folder the tool named after the archive, the
+    /// item in it too. (Seen on a real Mac, 13 Oct 2026: The Unarchiver
+    /// unpacks `big compressed.tar.bz2` into
+    /// `.TheUnarchiverTemp0/big compressed/`, and when that holds one item,
+    /// `mixed`, the result is `mixed`.)
+    static func tops(of path: String, for tool: Tool, archivePath: String) -> [String] {
+        guard let inside = inside(path, for: tool), let first = inside.first.map(String.init) else { return [] }
+        guard first == folderName(of: tool, archivePath: archivePath), inside.count > 2,
+              let second = inside.dropFirst().first.map(String.init) else { return [first] }
+        return [first, second]
+    }
+
+    /// A path's parts inside the tool's work folder, the place Keka's
+    /// helpers write into left out.
+    private static func inside(_ path: String, for tool: Tool) -> ArraySlice<Substring>? {
+        guard tool.worksBesideResult, let work = tool.workFolder(of: path) else { return nil }
+        var inside = path.dropFirst(work.count).split(separator: "/", omittingEmptySubsequences: true)[...]
+        if tool == .keka, inside.first.map(String.init) == Tool.kekaWritesInto {
+            inside = inside.dropFirst()
+        }
+        return inside
+    }
+
+    /// The name The Unarchiver or Keka gives the folder it makes for an
+    /// archive's items: the archive's name without its ending. For an
+    /// archive cut into numbered pieces (seen on a real Mac, 13 Oct
+    /// 2026) The Unarchiver takes the first piece's name without its
+    /// number (`photos.7z` for `photos.7z.001`), and Keka the same with
+    /// its last dot as an underscore (`photos_7z`).
+    static func folderName(of tool: Tool, archivePath: String) -> String {
+        guard let piece = ArchiveName.numberedPart(archivePath) else { return ArchiveName.baseName(of: archivePath) }
+        let name = ArchiveName.fileName(of: piece.whole)
+        guard tool == .keka, let dot = name.lastIndex(of: ".") else { return name }
+        return name[..<dot] + "_" + name[name.index(after: dot)...]
+    }
+
+    /// The ending of the work folder a MacPacker that keeps a cancelled
+    /// extraction from leaving anything behind extracts into.
+    static let macPackerWorkEnding = "macpack"
+
+    /// That work folder, when the place an extraction was followed into is
+    /// one or lies in one: `…/photos.macpack` (`photos (2).macpack` when
+    /// the name was taken), in the destination.
+    static func macPackerWorkFolder(of place: String?) -> String? {
+        guard let place else { return nil }
+        let parts = place.split(separator: "/", omittingEmptySubsequences: true)
+        let ending = "." + macPackerWorkEnding
+        guard let work = parts.lastIndex(where: { $0.hasSuffix(ending) && $0.count > ending.count }) else { return nil }
+        return "/" + parts[...work].joined(separator: "/")
+    }
+
+    /// Where MacPacker put the result once its work folder is gone. It
+    /// gives the result its place in one of two ways: the work folder
+    /// itself, renamed, when the result is a folder made for the archive
+    /// (`photos`, or `photos (2)`… when that is taken); or each item at its
+    /// top moved into the folder the work folder was in, under its own
+    /// name or, when that is taken, `photo (2).jpg`. Nothing when no
+    /// result of this extraction is there.
+    private func macPackerPlacedResult(_ entry: Watched, key: Key, work: String)
+        -> (root: String, tops: [String: String])? {
+        guard let lookup = entry.lookup else { return nil }
+        let parent = ArchiveName.folder(of: work)
+        // One of the archive's files, to tell the result by: the last, which
+        // is written last; any entry when they are all empty.
+        guard let place = lookup.lastSizedPlace ?? lookup.filePlaces.first ?? lookup.index.entries.indices.first
+        else { return nil }
+        let probe = lookup.index.entries[place].path
+        func isThere(_ path: String) -> Bool {
+            guard let changed = surroundings.changeTime(path) else { return false }
+            return changed >= entry.seenAt - Self.writtenMargin
+        }
+        // The work folder renamed after the archive.
+        for folder in Self.numbered(ArchiveName.baseName(of: key.archive), isFolder: true, by: .macPacker, in: parent) {
+            guard surroundings.fileState(folder) != .missing else { break }       // (the first free name)
+            if isThere(folder), surroundings.fileState(Self.join(folder, probe)) != .missing {
+                return (folder, [:])
+            }
+        }
+        // Its items moved up, under their own names or free ones.
+        let tops = allNumberedTops(entry, lookup: lookup, root: parent, numberedBy: .macPacker)
+        let path = Self.onDisk(probe, in: parent, tops: tops)
+        // (Put there by this extraction: an earlier copy stays put.)
+        guard surroundings.fileState(path) != .missing, isThere(path) else { return nil }
+        return (parent, tops)
     }
 
     /// MacPacker writes at the final place and tidies nothing up: with the
@@ -1253,7 +1882,8 @@ public struct Tracker: Sendable {
         guard let lookup = entry.lookup, let root = entry.extraction?.destination else { return (.unknown, nil) }
         guard let last = lookup.lastSizedPlace else { return (.complete, nil) }       // (nothing but empty files)
         let item = lookup.index.entries[last]
-        let path = Self.join(root, item.path)
+        let tops = entry.numberedTops
+        let path = Self.onDisk(item.path, in: root, tops: tops)
         guard case .file(let size) = surroundings.fileState(path), size == item.size else { return (.stopped, nil) }
         // Whole, but is it this extraction's? Extracted again over an
         // earlier copy and stopped short, the last file is there, whole,
@@ -1264,9 +1894,9 @@ public struct Tracker: Sendable {
         if let since, isWritten(path, since: since) == false {
             return (.stopped, nil)
         }
-        let lacking = filesLacking(lookup, since: since) { Self.join(root, $0) }
+        let lacking = filesLacking(lookup, since: since) { Self.onDisk($0, in: root, tops: tops) }
         if lacking > 0 {
-            return (.stopped, Self.lackingNote(lacking, of: lookup))
+            return (.incomplete, Self.lackingNote(lacking, of: lookup))
         }
         return (.complete, nil)
     }
@@ -1336,12 +1966,12 @@ public struct Tracker: Sendable {
                                  lines: inout [String]) {
         guard let entry = watched.removeValue(forKey: key), var extraction = entry.extraction else { return }
         // What was written of the last file since the last look.
-        if ending != .complete, let current = entry.current,
+        if ending != .complete, ending != .unchecked, let current = entry.current,
            case .file(let size) = surroundings.fileState(current.path) {
             let done = entry.lookup?.bytesDone(place: entry.place, written: size) ?? entry.settled.addingSaturating(size)
             extraction.written = max(extraction.written, done)
         }
-        if ending == .complete, let total = extraction.total {
+        if ending == .complete || ending == .unchecked, let total = extraction.total {
             extraction.written = total
             extraction.fileNumber = extraction.fileCount
         }
@@ -1447,12 +2077,13 @@ public struct Tracker: Sendable {
     /// one item at the top (a file, or a folder), or several. Returns what
     /// Open opens (the one item, or `root` itself, which holds them) and
     /// what Show in Finder selects.
-    static func leftBehind(in root: String, index: ArchiveIndex) -> (result: String, reveal: [String]) {
+    static func leftBehind(in root: String, index: ArchiveIndex, tops given: [String: String] = [:])
+        -> (result: String, reveal: [String]) {
         var tops: [String] = []
         var seen: Set<String> = []
         for entry in index.entries {
             guard let top = entry.path.split(separator: "/").first.map(String.init), seen.insert(top).inserted else { continue }
-            tops.append(top)
+            tops.append(given[top] ?? top)
         }
         if tops.count == 1, let only = tops.first {
             let item = join(root, only)
@@ -1509,9 +2140,9 @@ public struct Tracker: Sendable {
             line += "complete in \(took) (an archive of \(Amount.bytes(extraction.written)))"
         case .complete:
             line += "complete: \(Amount.bytes(extraction.written)) in \(took)"
-        case .stopped where note != nil:
+        case .incomplete:
             // Gone through to its end, but not all of it is there.
-            line += "not complete after \(took): \(note ?? "")"
+            line += "not complete after \(took): \(note ?? "some of its files are missing or cut short")"
         case .stopped:
             line += "stopped short"
             if let total = extraction.total {
@@ -1522,6 +2153,9 @@ public struct Tracker: Sendable {
                 line += " with \(Amount.bytes(extraction.written)) written"
             }
             line += " after \(took)"
+        case .unchecked:
+            line += "done after \(took): its result is in place, and its files couldn't be looked at "
+                + "(no list of the archive's contents)"
         case .unknown, nil:
             line += "ended after \(took), and whether it got to its end can't be told "
                 + "(\(Amount.bytes(extraction.written)) seen written"

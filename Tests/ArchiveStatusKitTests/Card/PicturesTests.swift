@@ -32,7 +32,7 @@ struct PicturesTests {
         return Array(picture.rgba[start..<(start + 4)])
     }
 
-    @Test(arguments: [PictureKind.box, .done, .type("zip"), .type("rar"), .type("7z"), .type("tbz2")])
+    @Test(arguments: [PictureKind.box, .done, .unchecked, .incomplete, .type("zip"), .type("rar"), .type("7z"), .type("tbz2")])
     func eachPictureIsASmallSquarePNG(kind: PictureKind) throws {
         let data = try #require(Pictures.png(kind))
         #expect(data.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
@@ -77,8 +77,39 @@ struct PicturesTests {
         }
     }
 
+    /// Firefox Downloads' "blocked" bar, in the grey of macOS's own
+    /// symbols: red, green and blue nearly alike.
+    @Test func theBarOfOneThatCouldNotBeCheckedIsGrey() throws {
+        let picture = try pixels(.unchecked)
+        let middle = pixel(picture, 48, 48)
+        #expect(middle[3] == 255)
+        #expect(middle[0] > 120 && middle[0] < 165)
+        #expect(abs(Int(middle[0]) - Int(middle[1])) < 4 && abs(Int(middle[2]) - Int(middle[0])) < 12)
+        // A bar: wide, not tall.
+        #expect(pixel(picture, 36, 48)[3] == 255 && pixel(picture, 60, 48)[3] == 255)
+        #expect(pixel(picture, 48, 36)[3] < 255 && pixel(picture, 48, 60)[3] < 255)
+    }
+
+    /// A bright red ring inside the darker red circle: bright on the
+    /// ring, the dark circle showing through its middle.
+    @Test func theRingOfAnIncompleteOneIsBrightRedAroundADarkMiddle() throws {
+        let picture = try pixels(.incomplete)
+        // On the ring, left and right of the middle and above and below it.
+        for (x, y) in [(27, 48), (69, 48), (48, 27), (48, 69)] {
+            let onRing = pixel(picture, x, y)
+            #expect(onRing[3] == 255, "bright at (\(x), \(y))")
+            #expect(onRing[0] > 240 && onRing[1] < 90 && onRing[2] < 80)
+        }
+        // Its middle is the circle itself: dark, see-through.
+        let middle = pixel(picture, 48, 48)
+        #expect(middle[3] > 30 && middle[3] < 90)
+        // …and so is the circle outside the ring.
+        let outside = pixel(picture, 48, 10)
+        #expect(outside[3] > 30 && outside[3] < 90)
+    }
+
     @Test func theSymbolSitsInTheMiddle() throws {
-        for kind in [PictureKind.box, .done, .type("zip"), .type("7z")] {
+        for kind in [PictureKind.box, .done, .unchecked, .incomplete, .type("zip"), .type("7z")] {
             let picture = try pixels(kind)
             var left = picture.width, right = 0, top = picture.height, bottom = 0
             for y in 0..<picture.height {

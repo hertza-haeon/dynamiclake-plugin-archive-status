@@ -118,7 +118,7 @@ enum TarReader {
             }
             offset += step
         }
-        return ArchiveIndex(format: .tar, entries: entries, parts: [source.path], isWhole: isWhole)
+        return ArchiveIndex(format: .tar, entries: entries, parts: source.paths, isWhole: isWhole)
     }
 
     /// The file, read a few blocks at a time: the headers of one item (a

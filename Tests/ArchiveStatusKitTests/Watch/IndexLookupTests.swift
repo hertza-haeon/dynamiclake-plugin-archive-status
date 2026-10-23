@@ -7,6 +7,46 @@
 import Testing
 @testable import ArchiveStatusKit
 
+/// An item at the top of an archive that was given a number on disk
+/// because its name was taken there (The Unarchiver, writing in place).
+struct NumberedTopTests {
+    let lookup = IndexLookup(ArchiveIndex(format: .zip, entries: [
+        ArchiveEntry(path: "album/disc 1/a.mp3", size: 10),
+        ArchiveEntry(path: "movie.bin", size: 20),
+        ArchiveEntry(path: "README", size: 30),
+        ArchiveEntry(path: "my.notes/n.txt", size: 40),
+    ], parts: []))
+
+    @Test(arguments: [
+        ("/x/album-1/disc 1/a.mp3", 0, "/x", "album", "album-1"),
+        ("/x/album-12/disc 1/a.mp3", 0, "/x", "album", "album-12"),
+        ("/x/movie-2.bin", 1, "/x", "movie.bin", "movie-2.bin"),
+        ("/x/README-1", 2, "/x", "README", "README-1"),
+        ("/x/my.notes-3/n.txt", 3, "/x", "my.notes", "my.notes-3"),
+    ])
+    func aNumberedTopIsRecognised(path: String, place: Int, root: String, top: String, onDisk: String) throws {
+        let found = try #require(lookup.matchNumberedTop(path))
+        #expect(found.match.place == place)
+        #expect(found.match.root == root)
+        #expect(found.top == top)
+        #expect(found.onDisk == onDisk)
+    }
+
+    @Test(arguments: ["/x/album/disc 1-1/a.mp3", "/x/album-1/other.mp3", "/x/album1/disc 1/a.mp3", "/x/movie.bin-1.tmp", "/x/elsewhere-1"])
+    func aNumberElsewhereIsNot(path: String) {
+        #expect(lookup.matchNumberedTop(path) == nil)
+    }
+
+    @Test func theNamesBeforeTheNumber() {
+        #expect(IndexLookup.unnumbered("album-1", isFile: false) == ["album"])
+        #expect(IndexLookup.unnumbered("movie-2.bin", isFile: true) == ["movie.bin"])
+        #expect(IndexLookup.unnumbered("README-1", isFile: true) == ["README"])
+        #expect(IndexLookup.unnumbered("v1.2-3.tar", isFile: true) == ["v1.2.tar"])
+        #expect(IndexLookup.unnumbered("album", isFile: false).isEmpty)
+        #expect(IndexLookup.unnumbered("-1", isFile: false).isEmpty)
+    }
+}
+
 struct IndexLookupTests {
     let lookup = IndexLookup(ArchiveIndex(format: .zip, entries: [
         ArchiveEntry(path: "album", size: 0, isFolder: true),

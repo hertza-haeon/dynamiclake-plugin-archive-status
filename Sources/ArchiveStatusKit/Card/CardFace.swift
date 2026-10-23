@@ -10,12 +10,21 @@
 ///              pill                    sneak peek
 ///              left      right         left          center                    right
 /// extracting   type      blue ring     blue folder   0.85/2.56GB · 11 seconds  33%
+/// waiting      type      blue ring     (nothing)     Waiting • photos.zip
 /// stalled      type      red ...       blue folder   Stalled • photos.zip      33%
 /// complete     type      green check   blue folder   Complete • photos.zip     blue open
+/// done         type      grey bar      blue folder   Done • photos.zip         blue open
 /// stopped      type      red cross     blue folder   Stopped • photos.zip
+/// incomplete   type      red ring      blue folder   Incomplete • photos.zip
 /// ```
 ///
-/// (On the stopped card the folder is there only when something was left.)
+/// (Waiting: the tool has the archive and has written none of it yet; it
+/// asks for a password, or reads the archive through first; the ring
+/// spins. On the stopped card the folder is there only when something was
+/// left. `Incomplete`: the tool went to the archive's end and files are
+/// missing.
+/// `Done` is said of an extraction whose result is in place and couldn't
+/// be checked file by file: `Complete` is kept for one that was.)
 ///
 /// "type" is the archive's type in a blue circle (`zip`, `rar`, `7z`). A
 /// card's first seconds show an archive box there instead; the box stays
@@ -26,7 +35,9 @@
 /// The plugin has one card. Several extractions under way share it (decided
 /// on 12 Oct 2026): their number stands where the type is, their sizes
 /// are added up, and at the end it says `3 Extractions Completed`, or
-/// `2/3 Extractions Completed` with the red cross, with the folder alone.
+/// `2/3 Extractions Completed` with the red cross, with the folder alone
+/// (`Done` for `Completed`, and the grey bar for the check, when one of
+/// them couldn't be checked).
 struct CardFace {
     /// A card shows the archive box this long, then the archive's type.
     static let boxSeconds = 4.0
@@ -115,7 +126,7 @@ struct CardFace {
     /// `zip`; four characters at most), or nothing when its name has no
     /// ending that can be shown: then the archive box stays.
     static func typeText(of name: String) -> String {
-        let ending = ArchiveName.lastExtension(of: name)
+        let ending = ArchiveName.typeExtension(of: name)
         guard ending.isEmpty == false, ending.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else { return "" }
         return String(ending.prefix(typeCharacters))
     }
@@ -189,6 +200,11 @@ struct CardFace {
         if let stalledSince {
             let status = statusLine("Stalled", name: subject.text, since: stalledSince, now: now)
             (line, linePhase, changesAt) = (status.text, status.phase, status.changesAt)
+        } else if progress.isWaiting {
+            // Nothing of it is written yet (the tool asks for a password,
+            // or reads the archive through first): no amounts to show.
+            let status = statusLine("Waiting", name: subject.text, since: max(cardSince, progress.startedAt), now: now)
+            (line, linePhase, changesAt) = (status.text, status.phase, status.changesAt)
         } else if let total = progress.total {
             let detail = detail(progress, settings: settings, now: now, changesAt: &changesAt)
             line = Self.line(CardText.pair(done: progress.written, total: total), detail)
@@ -199,6 +215,7 @@ struct CardFace {
         if case .one = subject, now < cardSince + Self.boxSeconds {
             changesAt = min(changesAt ?? .infinity, cardSince + Self.boxSeconds)      // the box gives way to the type
         }
+        let isOnlyWaiting = progress.isWaiting && stalledSince == nil
         var ring = Component.ring(value: progress.isWaiting ? nil : CardText.fraction(done: progress.written, total: progress.total),
                                   tint: "blue")
         if stalledSince != nil, let dots = pictures.base64(.stalled) {
@@ -207,9 +224,10 @@ struct CardFace {
         let surfaces = Surfaces(
             pillLeft: pillIcon(subject, isOver: false, cardSince: cardSince, settings: settings, now: now),
             pillRight: ring,
-            peekLeft: Self.showButton(activityID),
+            // (While it waits nothing is there to show, and nothing to count.)
+            peekLeft: isOnlyWaiting ? nil : Self.showButton(activityID),
             peekCenter: .text(line, style: "marquee"),
-            peekRight: percentSlot(CardText.percent(done: progress.written, total: progress.total)),
+            peekRight: isOnlyWaiting ? nil : percentSlot(CardText.percent(done: progress.written, total: progress.total)),
             capsule: capsule(subject, settings: settings))
         return Built(surfaces: surfaces, changesAt: changesAt, linePhase: linePhase)
     }
@@ -266,10 +284,16 @@ struct CardFace {
     /// two look the same (the wording and symbol chosen on 12 Oct 2026).
     /// `hasLeftovers`: something of it was left where it was being
     /// extracted, which Show in Finder can show.
-    func stopped(_ extraction: Extraction, activityID: String, cardSince: Double, lineSince: Double,
-                 hasLeftovers: Bool, settings: PluginSettings, now: Double) -> Built {
-        let line = statusLine("Stopped", name: extraction.name, since: lineSince, now: now)
-        let cross: Component = pictures.base64(.stopped).map { .picture(base64: $0) } ?? .status("failed", tint: "red")
+    ///
+    /// `isIncomplete`: the tool went through the archive to its end and
+    /// not every file is there (a damaged archive). The card then says
+    /// `Incomplete`, with a red ring for the cross (13 Oct 2026).
+    func stopped(_ extraction: Extraction, isIncomplete: Bool = false, activityID: String, cardSince: Double,
+                 lineSince: Double, hasLeftovers: Bool, settings: PluginSettings, now: Double) -> Built {
+        let line = statusLine(isIncomplete ? "Incomplete" : "Stopped", name: extraction.name, since: lineSince, now: now)
+        let cross: Component = isIncomplete
+            ? pictures.base64(.incomplete).map { .picture(base64: $0) } ?? .symbol("circle", tint: "red")
+            : pictures.base64(.stopped).map { .picture(base64: $0) } ?? .status("failed", tint: "red")
         let surfaces = Surfaces(
             pillLeft: pillIcon(.one(name: extraction.name), isOver: true, cardSince: cardSince, settings: settings, now: now),
             pillRight: cross,
@@ -284,22 +308,29 @@ struct CardFace {
     /// What the card says of several extractions that are over:
     /// `3 Extractions Completed` when all of them were, `2/3 Extractions
     /// Completed` when some stopped short (the wording chosen on 12 Oct
-    /// 2026).
-    static func summaryText(completed: Int, of count: Int) -> String {
-        completed == count ? "\(count) Extractions Completed" : "\(completed)/\(count) Extractions Completed"
+    /// 2026). `unchecked` of them ended with a result that couldn't be
+    /// checked: they count with the completed ones, and the word is then
+    /// `Done`, as on the card of one alone (13 Oct 2026).
+    static func summaryText(completed: Int, unchecked: Int = 0, of count: Int) -> String {
+        let word = unchecked > 0 ? "Done" : "Completed"
+        let ended = completed + unchecked
+        return ended == count ? "\(count) Extractions \(word)" : "\(ended)/\(count) Extractions \(word)"
     }
 
     /// Several extractions, over: the check when all are complete, the
-    /// cross when some stopped short; Show in Finder (when anything of
-    /// them is there) and no Open: there is no one item to open.
-    func summary(completed: Int, of count: Int, activityID: String, cardSince: Double, lineSince: Double,
-                 hasItems: Bool, settings: PluginSettings, now: Double) -> Built {
-        let line = heldLine(Self.summaryText(completed: completed, of: count), since: lineSince, now: now)
+    /// grey bar when some couldn't be checked, the cross when some stopped
+    /// short; Show in Finder (when anything of them is there) and no Open:
+    /// there is no one item to open.
+    func summary(completed: Int, unchecked: Int = 0, of count: Int, activityID: String, cardSince: Double,
+                 lineSince: Double, hasItems: Bool, settings: PluginSettings, now: Double) -> Built {
+        let line = heldLine(Self.summaryText(completed: completed, unchecked: unchecked, of: count), since: lineSince, now: now)
         let mark: Component
-        if completed == count {
-            mark = pictures.base64(.done).map { .picture(base64: $0) } ?? .status("success", tint: "green")
-        } else {
+        if completed + unchecked < count {
             mark = pictures.base64(.stopped).map { .picture(base64: $0) } ?? .status("failed", tint: "red")
+        } else if unchecked > 0 {
+            mark = uncheckedMark
+        } else {
+            mark = pictures.base64(.done).map { .picture(base64: $0) } ?? .status("success", tint: "green")
         }
         let surfaces = Surfaces(
             pillLeft: pillIcon(.several(count), isOver: true, cardSince: cardSince, settings: settings, now: now),
@@ -310,14 +341,26 @@ struct CardFace {
         return Built(surfaces: surfaces, changesAt: line.changesAt, linePhase: line.phase)
     }
 
-    // MARK: Complete
+    // MARK: Complete, and done
+
+    /// The grey bar of an extraction whose result couldn't be checked.
+    private var uncheckedMark: Component {
+        pictures.base64(.unchecked).map { .picture(base64: $0) } ?? .symbol("minus.circle.fill", tint: "gray")
+    }
 
     /// `lineSince` is when the line came up, or when the plugin last opened
     /// the sneak peek for it: a line too long stays still from then.
-    func complete(_ extraction: Extraction, activityID: String, cardSince: Double, lineSince: Double,
+    ///
+    /// `isChecked`: every file of the archive was looked at, and the card
+    /// says `Complete`. Where that couldn't be done (no list of the
+    /// archive's contents) and the result is in place all the same, it
+    /// says `Done`, with a grey bar for the check (13 Oct 2026).
+    func complete(_ extraction: Extraction, isChecked: Bool = true, activityID: String, cardSince: Double, lineSince: Double,
                   settings: PluginSettings, now: Double) -> Built {
-        let line = statusLine("Complete", name: extraction.name, since: lineSince, now: now)
-        let check: Component = pictures.base64(.done).map { .picture(base64: $0) } ?? .status("success", tint: "green")
+        let line = statusLine(isChecked ? "Complete" : "Done", name: extraction.name, since: lineSince, now: now)
+        let check: Component = isChecked
+            ? pictures.base64(.done).map { .picture(base64: $0) } ?? .status("success", tint: "green")
+            : uncheckedMark
         let surfaces = Surfaces(
             pillLeft: pillIcon(.one(name: extraction.name), isOver: true, cardSince: cardSince, settings: settings, now: now),
             pillRight: check,

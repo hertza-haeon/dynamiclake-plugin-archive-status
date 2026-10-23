@@ -116,6 +116,8 @@ struct CardFaceTests {
     @Test(arguments: [
         ("photos.zip", "zip"), ("GAME.PART1.RAR", "rar"), ("backup.7z", "7z"), ("sources.tar.gz", "gz"),
         ("old.tbz2", "tbz2"), ("weird.extension", "exte"), ("noending", ""), ("accent.zïp", ""), ("dots.", ""),
+        // A numbered piece is of its archive's type; other numbers are just an ending.
+        ("pieces.7z.001", "7z"), ("pieces.zip.004", "zip"), ("notes.txt.001", "001"),
     ])
     func theTypeIsTheNamesEndingInSmallLetters(name: String, type: String) {
         #expect(CardFace.typeText(of: name) == type)
@@ -212,6 +214,64 @@ struct CardFaceTests {
         #expect(built.surfaces.peekRight == .button(title: "Open", symbol: "arrow.up.forward.app.fill", actionID: "open:extraction-4", tint: "blue"))
         #expect(built.linePhase == .whole)
         #expect(built.changesAt == nil)
+    }
+
+    /// The tool has the archive and has written none of it yet (it asks
+    /// for a password, or reads the archive through first): `Waiting`, the
+    /// ring spinning, nothing to show and nothing to count (13 Oct 2026).
+    @Test func theWaitingFaceSaysWaitingWithTheNameAndNothingElse() throws {
+        let waiting = CardFace.Progress(written: 0, total: 2_000_000_000, speed: 0, secondsLeft: nil, secondsLeftChangeAt: nil,
+                                        startedAt: 0, isWaiting: true)
+        let built = face.extracting(waiting, of: .one(name: "photos.zip"), activityID: "x", cardSince: 0,
+                                    settings: PluginSettings(), now: 6)
+        #expect(built.surfaces.pillRight == .ring(value: nil, tint: "blue"))
+        #expect(built.surfaces.peekCenter == .text("Waiting • photos.zip", style: "marquee"))
+        #expect(built.surfaces.peekLeft == nil)
+        #expect(built.surfaces.peekRight == nil)
+        let several = face.extracting(waiting, of: .several(2), activityID: "x", cardSince: 0, settings: PluginSettings(), now: 6)
+        #expect(several.surfaces.peekCenter == .text("Waiting • 2 Extractions", style: "marquee"))
+    }
+
+    /// The tool went through a damaged archive to its end: `Incomplete`,
+    /// with a red ring where `Stopped` has its cross, and Show in Finder
+    /// for what is there.
+    @Test func theIncompleteFaceHasTheRingAndTheWord() throws {
+        let built = face.stopped(try ended("photos.zip"), isIncomplete: true, activityID: "extraction-4", cardSince: 0,
+                                 lineSince: 20, hasLeftovers: true, settings: PluginSettings(), now: 20)
+        #expect(built.surfaces.pillRight == .picture(base64: try #require(pictures.base64(.incomplete))))
+        #expect(built.surfaces.peekCenter == .text("Incomplete • photos.zip", style: "marquee"))
+        #expect(built.surfaces.peekLeft == CardFace.showButton("extraction-4"))
+        #expect(built.surfaces.peekRight == nil)
+    }
+
+    /// An extraction whose result is in place and couldn't be checked file
+    /// by file: `Done`, with Firefox Downloads' "blocked" bar in grey, and
+    /// the buttons of `Complete` (13 Oct 2026).
+    @Test func theDoneFaceHasTheGreyBarTheNameAndBothButtons() throws {
+        let built = face.complete(try ended("photos.tar.bz2"), isChecked: false, activityID: "extraction-4", cardSince: 0,
+                                  lineSince: 20, settings: PluginSettings(), now: 20)
+        #expect(built.surfaces.pillLeft == .picture(base64: try #require(pictures.base64(.type("bz2")))))
+        #expect(built.surfaces.pillRight == .picture(base64: try #require(pictures.base64(.unchecked))))
+        #expect(built.surfaces.peekLeft == CardFace.showButton("extraction-4"))
+        #expect(built.surfaces.peekCenter == .text("Done • photos.tar.bz2", style: "marquee"))
+        #expect(built.surfaces.peekRight == CardFace.openButton("extraction-4"))
+    }
+
+    @Test(arguments: [(2, 1, 3, "3 Extractions Done"), (0, 2, 2, "2 Extractions Done"), (1, 1, 3, "2/3 Extractions Done"),
+                      (0, 1, 2, "1/2 Extractions Done"), (3, 0, 3, "3 Extractions Completed"), (2, 0, 3, "2/3 Extractions Completed")])
+    func severalWithOneThatCouldNotBeCheckedAreSaidDone(completed: Int, unchecked: Int, count: Int, text: String) {
+        #expect(CardFace.summaryText(completed: completed, unchecked: unchecked, of: count) == text)
+    }
+
+    @Test func severalWithOneThatCouldNotBeCheckedHaveTheGreyBarUnlessOneStopped() throws {
+        let all = face.summary(completed: 2, unchecked: 1, of: 3, activityID: "x", cardSince: 0, lineSince: 50, hasItems: true,
+                               settings: PluginSettings(), now: 50)
+        #expect(all.surfaces.pillRight == .picture(base64: try #require(pictures.base64(.unchecked))))
+        #expect(all.surfaces.peekCenter == .text("3 Extractions Done", style: "marquee"))
+        let some = face.summary(completed: 1, unchecked: 1, of: 3, activityID: "x", cardSince: 0, lineSince: 50, hasItems: true,
+                                settings: PluginSettings(), now: 50)
+        #expect(some.surfaces.pillRight == .picture(base64: try #require(pictures.base64(.stopped))))
+        #expect(some.surfaces.peekCenter == .text("2/3 Extractions Done", style: "marquee"))
     }
 
     @Test func aFinishedCardShowsItsTypeEvenInItsFirstFourSeconds() throws {

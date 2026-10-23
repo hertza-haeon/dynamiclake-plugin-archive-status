@@ -107,22 +107,27 @@ public struct ArchiveIndex: Sendable, Equatable {
     /// without a total rather than held in memory.
     static let maxEntries = 1_000_000
 
-    /// Reads the index of the archive at `path`. For a multi-part archive
-    /// any part may be given.
+    /// Reads the index of the archive at `path`. For a multi-part RAR any
+    /// part may be given; for an archive cut into numbered pieces
+    /// (`photos.7z.001`…), its first piece.
     public static func read(at path: String) throws(IndexError) -> ArchiveIndex {
-        let source = try FileSource(path: path)
+        let isInPieces = ArchiveName.numberedPart(path) != nil
+        let source = try isInPieces ? FileSource(numberedFrom: path) : FileSource(path: path)
         let head = try source.bytes(at: 0, count: Int(min(source.size, 8)))
         if head.starts(with: RarReader.signature5) || head.starts(with: RarReader.signature4) {
+            // (A RAR has parts of its own kind, each with its headers; one
+            // cut into numbered pieces on top of that isn't read.)
+            guard isInPieces == false else { throw .notAnArchive }
             return try RarReader.read(anyPart: path)
         }
         if head.starts(with: SevenZipReader.signature) {
-            return try SevenZipReader.read(path: path)
+            return try SevenZipReader.read(paths: source.paths)
         }
         if TarReader.isTar(try source.bytes(at: 0, upTo: 512)) {
             return try TarReader.read(source)
         }
         if CompressedTarReader.isCompressed(head) {
-            return try CompressedTarReader.read(path: path)
+            return try CompressedTarReader.read(paths: source.paths)
         }
         // A zip is recognised by its end, not by its beginning: it may have
         // something else in front (a self-extracting one has a program).

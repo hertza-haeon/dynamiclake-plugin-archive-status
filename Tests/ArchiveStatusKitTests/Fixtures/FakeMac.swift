@@ -21,6 +21,11 @@ struct FakeMac: Sendable {
         var changeTimeAsked = 0
         var indexes: [String: Result<ArchiveIndex, IndexError>] = [:]
         var indexReads: [String] = []
+        /// What reading a list beside the loop gives, once it is done.
+        var laterIndexes: [String: Result<ArchiveIndex, IndexError>] = [:]
+        /// The lists whose reading beside the loop was begun, and given up.
+        var laterBegun: [String] = []
+        var laterDropped: [String] = []
         /// How long reading an index takes, by the made-up Mac's clock.
         var indexReadSeconds = 0.0
         /// How long one question about a file takes, by the same clock.
@@ -52,6 +57,22 @@ struct FakeMac: Sendable {
     func setIndexFailure(_ error: IndexError, for path: String) {
         state.withLock { $0.indexes[path] = .failure(error) }
     }
+
+    /// The reading of a list beside the loop comes to its end with this:
+    /// asked for from now on, it is there (if the reading was begun).
+    func finishLaterIndex(_ entries: [ArchiveEntry], format: ArchiveFormat = .compressedTar, for path: String) {
+        let index = ArchiveIndex(format: format, entries: entries, parts: [path])
+        state.withLock { $0.laterIndexes[path] = .success(index) }
+    }
+
+    func failLaterIndex(_ error: IndexError, for path: String) {
+        state.withLock { $0.laterIndexes[path] = .failure(error) }
+    }
+
+    /// The archives whose list was begun to be read beside the loop, and
+    /// those whose reading was given up, in order.
+    var laterBegun: [String] { state.withLock { $0.laterBegun } }
+    var laterDropped: [String] { state.withLock { $0.laterDropped } }
 
     /// How long reading an index takes, in seconds: the made-up Mac's
     /// clock moves on by as much each time one is read.
@@ -95,6 +116,11 @@ struct FakeMac: Sendable {
                     return $0.indexes[path] ?? .failure(.unreadable)
                 }
             },
+            beginLaterIndex: { path in state.withLock { $0.laterBegun.append(path) } },
+            laterIndex: { path in
+                state.withLock { $0.laterBegun.contains(path) && $0.laterDropped.contains(path) == false ? $0.laterIndexes[path] : nil }
+            },
+            dropLaterIndex: { path in state.withLock { $0.laterDropped.append(path) } },
             home: "/Users/me")
     }
 

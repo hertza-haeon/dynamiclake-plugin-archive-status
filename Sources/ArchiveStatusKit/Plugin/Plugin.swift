@@ -363,7 +363,8 @@ public struct Plugin {
             let done = min(member.written, size)
             written = written.addingSaturating(done)
             // (Stopped short: there is no more of it to come.)
-            total = total.addingSaturating(member.ending == nil || member.ending == .complete ? size : done)
+            let isWhole = member.ending == nil || member.ending == .complete || member.ending == .unchecked
+            total = total.addingSaturating(isWhole ? size : done)
         }
         // Until every one of those that run can tell its time left, none
         // is told. Those that wait take, each in its turn, what their size
@@ -463,8 +464,8 @@ public struct Plugin {
     /// them. One whose end can't be told is left out, saying nothing that
     /// can't be known (decided on 12 Oct 2026).
     private mutating func endGroup(now: Double) throws(LakeError) {
-        let untold = members.filter { $0.ending != .complete && $0.ending != .stopped }
-        unsaid += members.filter { $0.ending == .complete || $0.ending == .stopped }
+        let untold = members.filter { Self.isSaid($0.ending) == false }
+        unsaid += members.filter { Self.isSaid($0.ending) }
         members.removeAll()
         guard var card else {
             unsaid.removeAll()
@@ -599,18 +600,28 @@ public struct Plugin {
         self.card = card
     }
 
+    /// Whether the card says how an extraction ended: complete, done
+    /// (its result in place, unchecked) or stopped. One whose end can't be
+    /// told is left out.
+    private static func isSaid(_ ending: Extraction.Ending?) -> Bool {
+        ending == .complete || ending == .unchecked || ending == .stopped || ending == .incomplete
+    }
+
     /// The face of the card that says how the extractions ended: one alone
-    /// as `Complete` or `Stopped`, with its name; several by their number.
+    /// as `Complete`, `Done` or `Stopped`, with its name; several by their
+    /// number.
     private func endFace(_ card: Card, now: Double) -> CardFace.Built {
         if unsaid.count == 1, let only = unsaid.first {
-            if only.ending == .stopped {
-                return face.stopped(only, activityID: card.activityID, cardSince: card.createdAt, lineSince: card.lineSince,
+            if only.ending == .stopped || only.ending == .incomplete {
+                return face.stopped(only, isIncomplete: only.ending == .incomplete, activityID: card.activityID,
+                                    cardSince: card.createdAt, lineSince: card.lineSince,
                                     hasLeftovers: card.hasItems, settings: settings.settings, now: now)
             }
-            return face.complete(only, activityID: card.activityID, cardSince: card.createdAt, lineSince: card.lineSince,
-                                 settings: settings.settings, now: now)
+            return face.complete(only, isChecked: only.ending != .unchecked, activityID: card.activityID,
+                                 cardSince: card.createdAt, lineSince: card.lineSince, settings: settings.settings, now: now)
         }
-        return face.summary(completed: unsaid.filter { $0.ending == .complete }.count, of: unsaid.count,
+        return face.summary(completed: unsaid.filter { $0.ending == .complete }.count,
+                            unchecked: unsaid.filter { $0.ending == .unchecked }.count, of: unsaid.count,
                             activityID: card.activityID, cardSince: card.createdAt, lineSince: card.lineSince,
                             hasItems: card.hasItems, settings: settings.settings, now: now)
     }
@@ -618,9 +629,15 @@ public struct Plugin {
     /// What the card says of them, for the log.
     private var word: String {
         if unsaid.count == 1, let only = unsaid.first {
-            return only.ending == .complete ? "Complete" : "Stopped"
+            switch only.ending {
+            case .complete: return "Complete"
+            case .unchecked: return "Done"
+            case .incomplete: return "Incomplete"
+            default: return "Stopped"
+            }
         }
-        return CardFace.summaryText(completed: unsaid.filter { $0.ending == .complete }.count, of: unsaid.count)
+        return CardFace.summaryText(completed: unsaid.filter { $0.ending == .complete }.count,
+                                    unchecked: unsaid.filter { $0.ending == .unchecked }.count, of: unsaid.count)
     }
 
     /// Their names in a line, for the log.
@@ -681,7 +698,8 @@ public struct Plugin {
             log("\(what): Show in Finder")
         case "open":
             // Open is on the card of one finished extraction only.
-            guard card.saysEnd, shown.count == 1, let only = shown.first, only.ending == .complete,
+            guard card.saysEnd, shown.count == 1, let only = shown.first,
+                  only.ending == .complete || only.ending == .unchecked,
                   let result = only.result, exists(result) else {
                 log("\(what): Open: the extracted item isn't there")
                 return

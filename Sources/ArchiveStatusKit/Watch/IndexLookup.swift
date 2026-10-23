@@ -95,6 +95,45 @@ struct IndexLookup: Sendable {
         return nil
     }
 
+    /// The same for a file whose item at the top of the archive was given
+    /// a number because its name was taken where it goes: `album-1/a.jpg`
+    /// for `album/a.jpg`, `movie-2.bin` for `movie.bin`. (The Unarchiver,
+    /// set never to make a folder for what it extracts, writes each item
+    /// at its final place under the first such name that is free: seen on
+    /// a real Mac, 13 Oct 2026.) Also returns that item's name in the
+    /// archive and its name on disk.
+    func matchNumberedTop(_ path: String, notBefore position: Int = 0) -> (match: Match, top: String, onDisk: String)? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.isEmpty == false else { return nil }
+        for depth in stride(from: min(maxDepth, parts.count), through: 1, by: -1) {
+            let tail = parts.suffix(depth)
+            guard let first = tail.first.map(String.init) else { continue }
+            for original in Self.unnumbered(first, isFile: depth == 1) {
+                let candidate = ([original] + tail.dropFirst().map(String.init)).joined(separator: "/")
+                guard let found = places[candidate] else { continue }
+                let place = found.first { $0 >= position } ?? found[found.count - 1]
+                let root = "/" + parts.dropLast(depth).joined(separator: "/")
+                return (Match(place: place, depth: depth, root: root), original, first)
+            }
+        }
+        return nil
+    }
+
+    /// The names an item may have had before it was given a number:
+    /// `album` for `album-1`; for a file also `movie.bin` for
+    /// `movie-2.bin`, the number standing before its extension. Nothing
+    /// for a name without such a number.
+    static func unnumbered(_ name: String, isFile: Bool) -> [String] {
+        var names: [String] = []
+        if isFile, let match = name.wholeMatch(of: #/(.+)-\d+(\.[^.]+)/#) {
+            names.append(String(match.1) + String(match.2))
+        }
+        if let match = name.wholeMatch(of: #/(.+)-\d+/#) {
+            names.append(String(match.1))
+        }
+        return names
+    }
+
     /// How much is extracted once `written` bytes of the item at `place`
     /// are on disk.
     func bytesDone(place: Int, written: UInt64) -> UInt64 {

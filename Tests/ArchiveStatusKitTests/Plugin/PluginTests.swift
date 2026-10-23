@@ -483,7 +483,9 @@ struct PluginTests {
         #expect(rig.kinds.count { $0 == .dismiss } == 1)
     }
 
-    @Test func anExtractionThatLeftFilesOutSaysStoppedNotComplete() throws {
+    /// (`Incomplete` since 13 Oct 2026: the tool went to the archive's end
+    /// and files are missing, which is not a cancel. A red ring.)
+    @Test func anExtractionThatLeftFilesOutSaysIncompleteNotComplete() throws {
         // MacPacker goes through a damaged archive to its end, leaving out
         // what it can't read (a run of 12 Oct).
         var rig = Rig()
@@ -500,7 +502,9 @@ struct PluginTests {
         rig.lookout.processes = [macPacker([])]
         _ = try rig.plugin.step(now: 15.1, incoming: [])
         let surfaces = try #require(rig.link.sent.last?.surfaces)
-        #expect(text(surfaces.peekCenter) == "Stopped • photos.zip")
+        #expect(text(surfaces.peekCenter) == "Incomplete • photos.zip")
+        #expect(surfaces.pillRight == .picture(base64: try #require(rig.pictures.base64(.incomplete))))
+        #expect(surfaces.peekRight == nil, "no Open: what is there isn't all of it")
         #expect(surfaces.peekLeft == CardFace.showButton("extraction-1"), "what was extracted is there to be shown")
         #expect(rig.notes.log.contains("photos.zip: not complete after 15.1 s: 1 of its 3 files is missing or cut short; "
             + "at /Users/me/Desktop/album"))
@@ -1106,7 +1110,8 @@ struct PluginTests {
         let first = try #require(rig.link.sent.first)
         #expect(first.type == .create)
         #expect(first.surfaces?.pillRight == .ring(value: nil, tint: "blue"), "the ring spins")
-        #expect(text(first.surfaces?.peekCenter)?.hasPrefix("0.00/2.00GB") == true)
+        #expect(text(first.surfaces?.peekCenter) == "Waiting • photos.zip", "nothing of it is written yet")
+        #expect(first.surfaces?.peekLeft == nil && first.surfaces?.peekRight == nil, "nothing to show, nothing to count")
         #expect(rig.notes.log.contains("photos.zip: its card is shown (every extraction shows)"))
         // It begins at 1: the ring fills.
         try rig.run(from: 0.6, to: 6) { [rig] now in rig.unarchiving(at: now, both: false) }
@@ -1116,6 +1121,37 @@ struct PluginTests {
         }
         #expect(value > 0.2 && value < 0.3)
         #expect(rig.kinds.filter { $0 == .create }.count == 1)
+    }
+
+    /// Seen on a real Mac, 13 Oct 2026: an archive whose list of
+    /// contents couldn't be read (a folder DynamicLake wasn't let into)
+    /// ended without a card. With its result in place it says `Done`,
+    /// with the grey bar and both buttons, and Open opens it.
+    @Test func withoutAListOfContentsAResultInPlaceSaysDone() throws {
+        var rig = Rig(settings: #"{"values":{"minimumDuration":0}}"#)
+        rig.mac.setIndexFailure(.unreadable, for: rig.archive)
+        try rig.run(from: 0, to: 20.5) { [rig] now in rig.unarchiving(at: now, both: false) }
+        #expect(rig.notes.log.contains { $0.hasPrefix("photos.zip: done after ") && $0.hasSuffix("; at /Users/me/Downloads/big.bin") })
+        let end = try #require(rig.link.sent.last)
+        #expect(text(end.surfaces?.peekCenter) == "Done • photos.zip")
+        #expect(end.surfaces?.pillRight == .picture(base64: try #require(rig.pictures.base64(.unchecked))))
+        #expect(end.surfaces?.peekLeft == CardFace.showButton(end.activityID))
+        #expect(end.surfaces?.peekRight == CardFace.openButton(end.activityID))
+        #expect(end.presentSneakPeek == 7)
+        #expect(rig.notes.log.contains("photos.zip: Done is shown, its sneak peek open for 7 s"))
+        _ = try rig.plugin.step(now: 21, incoming: [.action(LakeAction(activityID: end.activityID, actionID: "open:" + end.activityID))])
+        #expect(rig.notes.opened == ["/Users/me/Downloads/big.bin"])
+    }
+
+    /// One of several that couldn't be checked: the card says `Done` of
+    /// them all, with the grey bar.
+    @Test func severalWithOneWithoutAListOfContentsSayDone() throws {
+        var rig = Rig(settings: #"{"values":{"minimumDuration":0}}"#)
+        rig.mac.setIndexFailure(.tooLarge, for: rig.other)
+        try rig.run(from: 0, to: 51) { [rig] now in rig.unarchiving(at: now) }
+        let end = try #require(rig.link.sent.last { $0.presentSneakPeek != nil })
+        #expect(text(end.surfaces?.peekCenter) == "2 Extractions Done")
+        #expect(end.surfaces?.pillRight == .picture(base64: try #require(rig.pictures.base64(.unchecked))))
     }
 
     /// With Minimum Duration above 0, an archive that only waits isn't
@@ -1130,6 +1166,7 @@ struct PluginTests {
         // Let go of without a file written: nothing ever shows.
         rig.lookout.processes = [unarchiver([])]
         _ = try rig.plugin.step(now: 41, incoming: [])
+        _ = try rig.plugin.step(now: 44, incoming: [])
         #expect(rig.link.sent.isEmpty)
         #expect(rig.notes.log.contains("photos.zip: let go of without being extracted"))
     }
@@ -1175,6 +1212,34 @@ struct PluginTests {
         #expect(rig.kinds.filter { $0 == .dismiss }.count == 1)
     }
 
+    /// Seen on a real Mac, 13 Oct 2026: Keka went at a damaged archive
+    /// with one helper after the other, and the card read `0/2 Extractions
+    /// Completed` for the one archive. It is one extraction, which stopped.
+    @Test func kekasHelpersOneAfterTheOtherAtADamagedArchiveAreOneExtraction() throws {
+        var rig = Rig(settings: #"{"values":{"minimumDuration":0}}"#)
+        let work = "/Users/me/Downloads/photos.kextraction"
+        rig.mac.put(.folder(items: 1), at: work)
+        try rig.run(from: 0, to: 6) { [rig] now in
+            let written = { (since: Double) in writing(work + "/Operation/big.bin", size: UInt64((now - since) * 100_000_000)) }
+            switch now {
+            case ..<2: return [kekaHelper([reading(rig.archive), written(0)], pid: 801)]
+            case 2.2..<2.5: return [kekaHelper([reading(rig.archive), writing(work + "/Operation/photos.tar", size: 5_000)], pid: 802)]
+            case 2.7..<5: return [kekaHelper([reading(rig.archive), written(2.7)], pid: 803)]
+            default: return []
+            }
+        }
+        #expect(rig.notes.log.contains("photos.zip: Keka goes at it again, with another of its helpers"))
+        #expect(rig.notes.log.contains { $0.contains("joins the card") } == false)
+        let two = try #require(rig.pictures.base64(.type("2")))
+        #expect(rig.link.sent.contains { $0.surfaces?.pillLeft == .picture(base64: two) } == false, "never two extractions")
+        // Keka takes its folder away and leaves nothing.
+        rig.mac.put(.missing, at: work)
+        try rig.run(from: 6.1, to: 7) { _ in [] }
+        let end = try #require(rig.link.sent.last)
+        #expect(text(end.surfaces?.peekCenter) == "Stopped • photos.zip")
+        #expect(rig.kinds.filter { $0 == .create }.count == 1)
+    }
+
     /// With Minimum Duration at 0, the pill comes as soon as a helper has
     /// the archive, with a ring that spins until its first file.
     @Test func withMinimumDurationAtZeroKekasArchiveShowsBeforeItsFirstFile() throws {
@@ -1183,7 +1248,8 @@ struct PluginTests {
         let first = try #require(rig.link.sent.first)
         #expect(first.type == .create)
         #expect(first.surfaces?.pillRight == .ring(value: nil, tint: "blue"), "the ring spins")
-        #expect(text(first.surfaces?.peekCenter)?.hasPrefix("0.00/2.00GB") == true)
+        #expect(text(first.surfaces?.peekCenter) == "Waiting • photos.zip", "nothing of it is written yet")
+        #expect(first.surfaces?.peekLeft == nil && first.surfaces?.peekRight == nil, "nothing to show, nothing to count")
         try rig.run(from: 0.6, to: 6) { [rig] now in [rig.kekaExtracting(at: now)[0]] }
         guard case .ring(let value?, _)? = rig.link.sent.last?.surfaces?.pillRight else {
             Issue.record("the ring should fill once the first file is written")

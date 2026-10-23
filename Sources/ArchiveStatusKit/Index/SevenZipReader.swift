@@ -18,12 +18,18 @@ enum SevenZipReader {
     static let signature: [UInt8] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]
 
     static func read(path: String) throws(IndexError) -> ArchiveIndex {
+        try read(paths: [path])
+    }
+
+    /// `paths`: the archive, or its pieces in order when it is cut into
+    /// several.
+    static func read(paths: [String]) throws(IndexError) -> ArchiveIndex {
         guard let library = SystemArchiveLibrary.shared else { throw .unreadable }
         guard let archive = library.readNew() else { throw .unreadable }
         defer { _ = library.readFree(archive) }
         guard library.supportSevenZip(archive) == SystemArchiveLibrary.ok else { throw .unreadable }
-        guard library.openFilename(archive, path, 64 * 1024) == SystemArchiveLibrary.ok else {
-            throw FileSource.isReadable(path) ? .damaged : .unreadable
+        guard library.open(archive, paths) == SystemArchiveLibrary.ok else {
+            throw paths.allSatisfy(FileSource.isReadable) ? .damaged : .unreadable
         }
 
         var entries: [ArchiveEntry] = []
@@ -56,7 +62,7 @@ enum SevenZipReader {
                 needsPassword = true
             }
         }
-        return ArchiveIndex(format: .sevenZip, entries: entries, parts: [path],
+        return ArchiveIndex(format: .sevenZip, entries: entries, parts: paths,
                             needsPassword: needsPassword, isWhole: isWhole)
     }
 }
@@ -96,6 +102,9 @@ struct SystemArchiveLibrary: Sendable {
     /// What a hard link points to; nothing for anything else.
     let hardlink: @convention(c) (Entry?) -> UnsafePointer<CChar>?
     let openFilename: @convention(c) (Archive?, UnsafePointer<CChar>?, Int) -> Int32
+    /// The same for several files that are one archive put end to end;
+    /// the list of names ends with nothing.
+    let openFilenames: @convention(c) (Archive?, UnsafePointer<UnsafePointer<CChar>?>?, Int) -> Int32
     let nextHeader: @convention(c) (Archive?, UnsafeMutablePointer<Entry?>?) -> Int32
     let hasEncryptedEntries: @convention(c) (Archive?) -> Int32
     let pathnameUTF8: @convention(c) (Entry?) -> UnsafePointer<CChar>?
@@ -103,6 +112,16 @@ struct SystemArchiveLibrary: Sendable {
     let sizeIsSet: @convention(c) (Entry?) -> Int32
     let filetype: @convention(c) (Entry?) -> mode_t
     let entryIsEncrypted: @convention(c) (Entry?) -> Int32
+
+    /// Opens an archive to read: one file, or the pieces of one cut into
+    /// several, in order.
+    func open(_ archive: Archive?, _ paths: [String]) -> Int32 {
+        guard paths.count > 1 else { return openFilename(archive, paths.first, 64 * 1024) }
+        let names = paths.map { strdup($0) }
+        defer { names.forEach { free($0) } }
+        let list = names.map { UnsafePointer($0) } + [nil]
+        return list.withUnsafeBufferPointer { openFilenames(archive, $0.baseAddress, 64 * 1024) }
+    }
 
     /// The library, or nothing when it or one of its functions is missing.
     static let shared: SystemArchiveLibrary? = load()
@@ -130,6 +149,9 @@ struct SystemArchiveLibrary: Sendable {
             let hardlink = function("archive_entry_hardlink", as: (@convention(c) (Entry?) -> UnsafePointer<CChar>?).self),
             let openFilename = function("archive_read_open_filename",
                                         as: (@convention(c) (Archive?, UnsafePointer<CChar>?, Int) -> Int32).self),
+            let openFilenames = function(
+                "archive_read_open_filenames",
+                as: (@convention(c) (Archive?, UnsafePointer<UnsafePointer<CChar>?>?, Int) -> Int32).self),
             let nextHeader = function("archive_read_next_header",
                                       as: (@convention(c) (Archive?, UnsafeMutablePointer<Entry?>?) -> Int32).self),
             let hasEncryptedEntries = function("archive_read_has_encrypted_entries",
@@ -149,7 +171,8 @@ struct SystemArchiveLibrary: Sendable {
             readNew: readNew, readFree: readFree, supportSevenZip: supportSevenZip,
             supportTar: supportTar, supportGzip: supportGzip, supportBzip2: supportBzip2, supportXz: supportXz,
             readDataBlock: readDataBlock, pathname: pathname, hardlink: hardlink,
-            openFilename: openFilename, nextHeader: nextHeader, hasEncryptedEntries: hasEncryptedEntries,
+            openFilename: openFilename, openFilenames: openFilenames, nextHeader: nextHeader,
+            hasEncryptedEntries: hasEncryptedEntries,
             pathnameUTF8: pathnameUTF8, size: size, sizeIsSet: sizeIsSet, filetype: filetype,
             entryIsEncrypted: entryIsEncrypted)
     }

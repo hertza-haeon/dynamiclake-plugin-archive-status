@@ -14,8 +14,9 @@ extracted: how much is done, how fast it goes, how long is left. When it is
 over, you can show the result in the Finder or open it, without looking for
 it.
 
-- **No permission needed.** No Accessibility, no Automation, nothing to
-  allow.
+- **No Accessibility, no Automation.** The plugin presses nothing in any
+  app. macOS may ask once to let DynamicLake into the folder an archive
+  is in: see [Permissions](#permissions).
 - **Works with** MacPacker, The Unarchiver, Keka and Archive Utility (what
   a double-click on an archive in the Finder uses).
 - **Stays on your Mac.** The plugin sends nothing over the internet.
@@ -61,8 +62,25 @@ Your settings are kept.
 
 ## Permissions
 
-None. The plugin presses nothing in any app, so it needs neither
-Accessibility nor Automation, and macOS asks you nothing for it.
+The plugin presses nothing in any app, so it needs neither Accessibility
+nor Automation.
+
+**Access to the folder an archive is in.** To know what an archive holds,
+the plugin reads its list of contents. macOS counts that as DynamicLake
+reading a file in that folder. So the first time you extract an archive
+that is in your Desktop, Documents or Downloads folder, or on another
+disk, macOS may ask whether DynamicLake may access files there. It asks
+once for each of these places.
+
+- **Allow**, and everything shows. Nothing shows in the notch while the
+  question is on the screen.
+- **Don't Allow**, and an extraction there still shows its pill and how
+  far it is, counted on the archive's own size. With The Unarchiver and
+  Keka it ends on `Done` instead of `Complete`: the plugin can't check
+  the files. With MacPacker its card goes away at the end without a word.
+
+You can change your answer in **System Settings → Privacy & Security →
+Files & Folders → DynamicLake**.
 
 ## What you see
 
@@ -80,10 +98,13 @@ later.
 
 | The extraction is… | Pill, right side | Sneak peek | Buttons |
 | --- | --- | --- | --- |
+| Waiting (the app has the archive and has written nothing yet) | ring that spins | `Waiting • photos.zip` | none |
 | Under way | progress ring | `0.85/2.56GB · 11 seconds` and `33%` | Show in Finder |
 | Stalled (nothing written for 15 seconds) | red **…** | `Stalled • photos.zip` and `33%` | Show in Finder |
 | Complete | green **✓** | `Complete • photos.zip` | Show in Finder, Open |
+| Done (extracted, and the plugin couldn't check its files) | grey **–** | `Done • photos.zip` | Show in Finder, Open |
 | Stopped short (canceled, or failed) | red **✕** | `Stopped • photos.zip` | Show in Finder, when something was left |
+| Incomplete (extracted to the end, with files missing) | red **○** | `Incomplete • photos.zip` | Show in Finder |
 
 While it extracts, the line reads the amount and the total (`294/871MB`, or
 `0.85/2.56GB` from 1 GB), then the time left, the speed, or both in turn:
@@ -113,7 +134,8 @@ The plugin is one card in the notch, however many extractions are running.
 - **The time left** is that of the extraction that finishes last.
 - **At the end, one card:** `3 Extractions Completed`, with Show in Finder
   for all of them. If some stopped short: `2/3 Extractions Completed`, with
-  the red **✕**.
+  the red **✕**. If one of them is only `Done`, the card says `Done` for
+  `Completed`: `3 Extractions Done`, with the grey **–**.
 - **An extraction that begins when all the others are over** starts afresh,
   on the same card.
 - **The Unarchiver takes the archives it is given one after the other.**
@@ -148,8 +170,9 @@ choose **Settings**. Changes apply within a few seconds.
   speed. An extraction it expected to be short shows after all if it turns
   out longer.
 - With The Unarchiver or Keka and Minimum Duration at 0, the pill comes as
-  soon as the app has the archive, with a ring that spins until its first
-  file is written.
+  soon as the app has the archive, and reads `Waiting` until its first
+  file is written: while the app reads the archive through, or asks you
+  for a password.
 - An app may need a while after the last file is written: Keka, for one,
   goes over every file of an archive that was downloaded from the
   internet. The ring is full meanwhile, and `Complete` comes when the app
@@ -162,13 +185,24 @@ choose **Settings**. Changes apply within a few seconds.
   bytes.
 - The amounts are those of the files once extracted, read from the
   archive's own list of contents: `zip`, `rar`, `7z`, `tar`, and compressed
-  tars (`tar.gz`, `tar.bz2`, `tar.xz`).
-- A compressed tar has to be unpacked to be read. The plugin gives that 3
-  seconds; a very large one is followed by how far the tool has read into
-  the archive instead, and the amounts are then the archive's own size.
+  tars (`tar.gz`, `tar.bz2`, `tar.xz`). A zip, a RAR or a 7z under another
+  name is read the same (`cbz`, `cbr`, `jar`, `apk`, `epub`…).
+- An archive of another kind (`zst`, `lz4`, `iso`, `cab`, `cpio`…) is
+  followed with The Unarchiver and Keka, by how far the app has read into
+  it: the amounts are the archive's own size, and it ends on `Done`.
+- A compressed tar has to be unpacked to be read. A large one (from about
+  100 MB for a `tar.bz2`, more for a `tar.xz` or a `tar.gz`) takes longer
+  than the plugin can stand still for: its list is then read on the side
+  while the app extracts, which keeps one processor core busy for as long.
+  Until the list is there, the extraction is followed by how far the app
+  has read into the archive, and the amounts are the archive's own size.
+  At the end its files are checked as any archive's are.
 - An extraction whose size can't be told at all keeps the ring spinning and
   shows the amount written alone. Beside others that have a size, it counts
   in their number only.
+- An archive in several parts (`photos.7z.001`, `photos.7z.002`…, or
+  `photos.zip` with `photos.z01`, `photos.z02`…) is one extraction, under
+  the name of the part you open.
 
 **How it ends**
 
@@ -178,6 +212,13 @@ choose **Settings**. Changes apply within a few seconds.
   goes away without a word.
 - `Complete` means every file of the archive is there, with its size. The
   plugin doesn't read what is in the files.
+- `Incomplete` means the app went through the archive to its end and
+  some of its files are missing or cut short: a damaged archive.
+- `Done` means the app put what it extracted in place, and the plugin
+  couldn't check the files: it had no list of the archive's contents (an
+  archive of a kind it can't read, a folder DynamicLake isn't allowed
+  into, or a large compressed tar whose list wasn't read 20 seconds after
+  the app was done). With The Unarchiver and Keka.
 
 **The notch and other apps**
 
@@ -192,9 +233,8 @@ choose **Settings**. Changes apply within a few seconds.
 - Extractions by other apps than MacPacker, The Unarchiver, Keka and
   Archive Utility.
 - With Archive Utility, a `rar`: Archive Utility doesn't extract those.
-- With The Unarchiver set never to create a folder for the extracted
-  files, an extraction whose items' names are already taken where they
-  go.
+- With MacPacker and Archive Utility, an archive that is neither a zip, a
+  RAR, a 7z nor a tar (`iso`, `cab`, `zst`…).
 - With MacPacker, a compressed tar that was already open in MacPacker when
   the plugin started, or one so small that MacPacker unpacks it in a blink.
 
@@ -205,6 +245,12 @@ extraction shows nothing: look at **Minimum Duration** in the
 [settings](#settings). An app that first asks you something (a password,
 access to a folder) shows once it starts extracting. Otherwise quit
 DynamicLake and open it again.
+
+**The card says `Done` instead of `Complete`, or the amounts are those of
+the archive itself.** The plugin couldn't read the archive's list of
+contents, or not yet: DynamicLake isn't allowed into the folder the
+archive is in (see [Permissions](#permissions)), or it is a large
+compressed tar.
 
 **DynamicLake says the plugin can't be run.** In Terminal:
 
@@ -230,7 +276,10 @@ Its last lines usually tell what happened.
   is pressed in it.
 - It **reads the archive's list of contents**, to know how much there is to
   extract. A compressed tar is unpacked for that in memory, by macOS's own
-  archive library; nothing is written.
+  archive library; nothing is written. For a large one that takes as long
+  as extracting it does, on one processor core. This is the one thing
+  macOS may ask you about, in DynamicLake's name: see
+  [Permissions](#permissions).
 - It **looks whether the extracted files are there**, one by one, by their
   names. It doesn't read them.
 - It **never writes** into an archive, into what was extracted or into your

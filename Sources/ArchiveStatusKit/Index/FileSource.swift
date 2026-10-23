@@ -9,33 +9,67 @@ import Foundation
 /// A file opened for reading, read a piece at a time. It is never written
 /// to, and it is closed when this object goes.
 ///
+/// An archive cut into numbered pieces (`photos.7z.001`, `photos.7z.002`…)
+/// is read as the one file its pieces make put end to end.
+///
 /// Archives come from anywhere, so every read is checked against the file's
 /// real size: a wrong number inside an archive ends in an `IndexError`,
 /// never in a crash.
 final class FileSource {
+    /// The file, or the first of its pieces.
     let path: String
+    /// Every piece, in order: the file alone when it is in one piece.
+    let paths: [String]
     let size: UInt64
-    private let descriptor: Int32
+    /// Each piece: where it begins in the whole, and how long it is.
+    private let pieces: [(descriptor: Int32, start: UInt64, size: UInt64)]
 
     /// The most that is read in one piece.
     static let maxPiece = 8 * 1024 * 1024
+    /// The most pieces an archive is read from.
+    static let maxPieces = 999
 
-    init(path: String) throws(IndexError) {
-        // O_NONBLOCK: opening something that isn't a plain file never waits.
-        let descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
-        guard descriptor >= 0 else { throw .unreadable }
-        var info = stat()
-        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0 else {
-            close(descriptor)
-            throw .unreadable
+    convenience init(path: String) throws(IndexError) {
+        try self.init(pieces: [path])
+    }
+
+    /// The pieces of an archive cut into numbered ones, from the first
+    /// (`ArchiveName.numberedParts`): as many as are there, one after the
+    /// other.
+    convenience init(numberedFrom first: String) throws(IndexError) {
+        var found: [String] = []
+        for piece in ArchiveName.numberedParts(from: first).prefix(Self.maxPieces) {
+            var info = stat()
+            guard lstat(piece, &info) == 0 else { break }
+            found.append(piece)
         }
-        self.path = path
-        self.size = UInt64(info.st_size)
-        self.descriptor = descriptor
+        try self.init(pieces: found)
+    }
+
+    private init(pieces paths: [String]) throws(IndexError) {
+        guard let first = paths.first else { throw .unreadable }
+        var opened: [(descriptor: Int32, start: UInt64, size: UInt64)] = []
+        var total: UInt64 = 0
+        for path in paths {
+            // O_NONBLOCK: opening something that isn't a plain file never waits.
+            let descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+            var info = stat()
+            guard descriptor >= 0, fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0 else {
+                if descriptor >= 0 { close(descriptor) }
+                for piece in opened { close(piece.descriptor) }
+                throw .unreadable
+            }
+            opened.append((descriptor, total, UInt64(info.st_size)))
+            total = total.addingSaturating(UInt64(info.st_size))
+        }
+        self.path = first
+        self.paths = paths
+        self.size = total
+        self.pieces = opened
     }
 
     deinit {
-        close(descriptor)
+        for piece in pieces { close(piece.descriptor) }
     }
 
     /// Exactly `count` bytes from `offset` on. Asking for more than the file
@@ -47,9 +81,13 @@ final class FileSource {
         var buffer = [UInt8](repeating: 0, count: count)
         var done = 0
         while done < count {
+            let place = offset + UInt64(done)
+            // (The piece this byte is in; an empty piece holds none.)
+            guard let piece = pieces.last(where: { $0.start <= place && place < $0.start + $0.size }) else { throw .damaged }
+            let wanted = Int(min(UInt64(count - done), piece.start + piece.size - place))
             let read = buffer.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
-                return pread(descriptor, base + done, count - done, off_t(offset) + off_t(done))
+                return pread(piece.descriptor, base + done, wanted, off_t(place - piece.start))
             }
             if read < 0 {
                 if errno == EINTR { continue }
