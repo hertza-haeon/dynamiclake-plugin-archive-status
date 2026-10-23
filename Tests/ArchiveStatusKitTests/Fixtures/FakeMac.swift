@@ -15,6 +15,8 @@ struct FakeMac: Sendable {
         var disk: [String: FileState] = [:]
         /// When each thing on the disk last changed.
         var changed: [String: Double] = [:]
+        /// The folders the tracker listed, in order.
+        var hiddenListings: [String] = []
         /// The made-up Mac's clock.
         var clock = 1_000_000.0
         /// How many times it was asked when something last changed.
@@ -94,6 +96,9 @@ struct FakeMac: Sendable {
     /// The archives whose index was read, in order.
     var indexReads: [String] { state.withLock { $0.indexReads } }
 
+    /// The folders listed for MacPacker's hidden work folders, in order.
+    var hiddenListings: [String] { state.withLock { $0.hiddenListings } }
+
     var surroundings: Surroundings {
         Surroundings(
             fileState: { path in
@@ -121,6 +126,14 @@ struct FakeMac: Sendable {
                 state.withLock { $0.laterBegun.contains(path) && $0.laterDropped.contains(path) == false ? $0.laterIndexes[path] : nil }
             },
             dropLaterIndex: { path in state.withLock { $0.laterDropped.append(path) } },
+            hiddenWorkFolders: { folder in
+                state.withLock { state in
+                    state.hiddenListings.append(folder)
+                    return state.disk.keys.filter {
+                        ArchiveName.folder(of: $0) == folder && Tracker.isMacPackerHiddenWorkFolder(ArchiveName.fileName(of: $0))
+                    }.sorted()
+                }
+            },
             home: "/Users/me")
     }
 

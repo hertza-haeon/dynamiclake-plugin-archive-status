@@ -101,6 +101,8 @@ struct MacPackerWorkFolderTrackingTests {
         _ = tracker.step(now: 1.0, processes: [macPacker([])])
         #expect(tracker.ended.isEmpty, "waited for")
         #expect(tracker.extractions.count == 1)
+        // (Time passes on the Mac's clock too: the folder has been still.)
+        mac.clock += Tracker.unarchiverFinishWait + 0.1
         _ = tracker.step(now: 1.0 + Tracker.unarchiverFinishWait + 0.1, processes: [macPacker([])])
         let extraction = try #require(tracker.ended.last)
         #expect(extraction.ending == .stopped)

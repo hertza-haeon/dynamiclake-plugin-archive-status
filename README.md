@@ -281,7 +281,9 @@ Its last lines usually tell what happened.
   macOS may ask you about, in DynamicLake's name: see
   [Permissions](#permissions).
 - It **looks whether the extracted files are there**, one by one, by their
-  names. It doesn't read them.
+  names. It doesn't read them. MacPacker extracts into a hidden folder of
+  its own first (`.MacPacker-…`), whose name can't be guessed: for that
+  one, the plugin looks at the names in the folder being extracted to.
 - It **never writes** into an archive, into what was extracted or into your
   folders. All it writes is its own log.
 - Its two buttons use macOS's `open` command, for the Finder and for the

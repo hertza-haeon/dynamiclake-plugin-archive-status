@@ -44,6 +44,10 @@ public struct Surroundings: Sendable {
     public var laterIndex: @Sendable (String) -> Result<ArchiveIndex, IndexError>?
     /// Gives that reading up.
     public var dropLaterIndex: @Sendable (String) -> Void
+    /// The hidden work folders MacPacker has in a folder
+    /// (`.MacPacker-<a random id>`), as paths: the one listing of a folder
+    /// the tracker asks for. Their names can't be told any other way.
+    public var hiddenWorkFolders: @Sendable (String) -> [String]
     /// The user's home folder.
     public var home: String
 
@@ -54,6 +58,7 @@ public struct Surroundings: Sendable {
                 beginLaterIndex: @escaping @Sendable (String) -> Void = { _ in },
                 laterIndex: @escaping @Sendable (String) -> Result<ArchiveIndex, IndexError>? = { _ in nil },
                 dropLaterIndex: @escaping @Sendable (String) -> Void = { _ in },
+                hiddenWorkFolders: @escaping @Sendable (String) -> [String] = { _ in [] },
                 home: String) {
         self.fileState = fileState
         self.changeTime = changeTime
@@ -62,6 +67,7 @@ public struct Surroundings: Sendable {
         self.beginLaterIndex = beginLaterIndex
         self.laterIndex = laterIndex
         self.dropLaterIndex = dropLaterIndex
+        self.hiddenWorkFolders = hiddenWorkFolders
         self.home = home
     }
 
@@ -94,6 +100,10 @@ public struct Surroundings: Sendable {
             beginLaterIndex: { LaterIndexes.shared.begin($0) },
             laterIndex: { LaterIndexes.shared.result($0) },
             dropLaterIndex: { LaterIndexes.shared.drop($0) },
+            hiddenWorkFolders: { folder in
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
+                return names.filter(Tracker.isMacPackerHiddenWorkFolder).map { Tracker.join(folder, $0) }
+            },
             home: NSHomeDirectory())
     }
 }
@@ -220,6 +230,8 @@ public struct Tracker: Sendable {
     static let endedKept = 20
     /// How many of a tool's own copies of archives are remembered.
     static let copiesKept = 20
+    /// How many folders' listings are remembered (`hiddenWorkFolders`).
+    static let hiddenListingsKept = 64
     /// How many of an archive's first files are looked for, to tell that
     /// MacPacker has begun to extract it (see `findBeginning`).
     static let firstFilesTried = 3
@@ -254,6 +266,9 @@ public struct Tracker: Sendable {
     /// it has let go of an archive none of whose files was seen being
     /// written, in seconds.
     static let unarchiverFinishWait = 2.0
+    /// The longest MacPacker is taken to be moving its result out of its
+    /// work folder, after letting go of the archive, in seconds.
+    static let longestMoveOut = 300.0
     /// Without an index, the tool counts as having read the archive to its
     /// end when no more than this is left of it, in bytes, or a hundredth
     /// of it: a tar ends in empty blocks that needn't be read.
@@ -272,6 +287,9 @@ public struct Tracker: Sendable {
     private var copies: [Int32: [(copy: String, archive: String)]] = [:]
     /// Where MacPacker last extracted into, the latest first.
     private var recentPlaces: [String] = []
+    /// MacPacker's hidden work folders found in a folder, and when that
+    /// folder had last changed: listed again only once it changes.
+    private var hiddenListings: [String: (changed: Double, found: [String])] = [:]
     /// Archives whose extraction is over while the tool still has them
     /// open (The Unarchiver keeps an archive for seconds after it is done
     /// with it, or until the others it was given are done too): not to be
@@ -727,7 +745,7 @@ public struct Tracker: Sendable {
     /// being written: for each, its own name if that was written by this
     /// extraction, else the first numbered one that was.
     private func allNumberedTops(_ entry: Watched, lookup: IndexLookup, root: String,
-                                 numberedBy tool: Tool = .theUnarchiver) -> [String: String] {
+                                 numbering: Numbering = .hyphen) -> [String: String] {
         var tops = entry.numberedTops
         var seen: Set<String> = []
         for item in lookup.index.entries {
@@ -736,7 +754,7 @@ public struct Tracker: Sendable {
             let top = String(path[..<slash])
             guard seen.insert(top).inserted, tops[top] == nil else { continue }
             let isFolder = slash != path.endIndex || item.isFolder
-            for name in Self.numbered(top, isFolder: isFolder, by: tool, in: root) {
+            for name in Self.numbered(top, isFolder: isFolder, numbering: numbering, in: root) {
                 guard let changed = surroundings.changeTime(name) else { break }       // (the first free name: not there)
                 if changed >= entry.seenAt - Self.writtenMargin {
                     if name != Self.join(root, top) { tops[top] = ArchiveName.fileName(of: name) }
@@ -962,7 +980,10 @@ public struct Tracker: Sendable {
     /// it extracts: beside the archive, in Downloads, where it extracted
     /// last, and in a folder named after the archive in each of those; and,
     /// for a MacPacker that extracts into a work folder, in
-    /// `<name>.macpack` in each of those places. Extracting from its copy
+    /// `<name>.macpack` in each of those places, and in the hidden work
+    /// folder a later MacPacker makes in them, `.MacPacker-<a random id>`,
+    /// found by listing the places that changed since MacPacker opened the
+    /// archive (`hiddenWorkFolders`). Extracting from its copy
     /// of a compressed tar, MacPacker names the work folder after the copy:
     /// after the tar inside, whose name may not be the archive's
     /// (`photos.tar.gz.001` holding `trip.tar`). One that is there, written
@@ -983,8 +1004,31 @@ public struct Tracker: Sendable {
             for root in [base] + named + inWork where roots.contains(root) == false {
                 roots.append(root)
             }
+            for folder in [base] + named {
+                for work in hiddenWorkFolders(in: folder, since: entry.seenAt - Self.beginningMargin)
+                where roots.contains(work) == false {
+                    roots.append(work)
+                }
+            }
         }
         beginIfWritten(key, in: roots, now: now, lines: &lines)
+    }
+
+    /// MacPacker's hidden work folders in `folder` made since `since`. The
+    /// folder is listed only when it has changed since then, and listed
+    /// again only once it changes again: making a folder in it changes it,
+    /// what is written in that folder doesn't.
+    private mutating func hiddenWorkFolders(in folder: String, since: Double) -> [String] {
+        guard let changed = surroundings.changeTime(folder), changed >= since else { return [] }
+        let found: [String]
+        if let listed = hiddenListings[folder], listed.changed == changed {
+            found = listed.found
+        } else {
+            found = surroundings.hiddenWorkFolders(folder)
+            if hiddenListings.count >= Self.hiddenListingsKept { hiddenListings.removeAll() }
+            hiddenListings[folder] = (changed, found)
+        }
+        return found.filter { (surroundings.changeTime($0) ?? 0) >= since }
     }
 
     /// Begins the extraction of an archive when one of its first files is
@@ -1501,9 +1545,14 @@ public struct Tracker: Sendable {
                 watched[key] = entry
                 if surroundings.fileState(work) != .missing {
                     // MacPacker puts the result in place right after it
-                    // lets go of the archive: a rename or a few. Still
-                    // there past the wait, it never will: quit mid-way.
-                    if now - since < Self.unarchiverFinishWait { return }
+                    // lets go of the archive: a rename or a few, or its
+                    // items moved out one by one, which for 30,000 files
+                    // took seconds (seen on a real Mac, 23 Oct 2026), each
+                    // changing the work folder. Still there, and still for
+                    // the moment waited, it never will: quit mid-way.
+                    let stillFor = surroundings.changeTime(work).map { surroundings.wallClock() - $0 } ?? .infinity
+                    let isMovingOut = stillFor < Self.unarchiverFinishWait && now - since < Self.longestMoveOut
+                    if now - since < Self.unarchiverFinishWait || isMovingOut { return }
                     finish(key, as: .stopped, note: nil, now: now, lines: &lines)
                     return
                 }
@@ -1757,22 +1806,53 @@ public struct Tracker: Sendable {
                 top == nil ? [] : numbered(base, isFolder: true, by: tool, in: folder))
     }
 
+    /// How a tool names an item whose own name is taken where it goes.
+    enum Numbering: Sendable {
+        /// The Unarchiver's: `photos-1`, `notes-1.txt`.
+        case hyphen
+        /// Keka's: `photos 2`, `notes 2.txt`.
+        case space
+        /// MacPacker's, extracting into a `.macpack` work folder:
+        /// `photos (2)`, `notes (2).txt`.
+        case parenthesis
+        /// Archive Utility's, and MacPacker's, extracting into a hidden work
+        /// folder: `photos 2`, `notes 2.txt`, a compressed tar's whole ending
+        /// kept (`archive 2.tar.gz`), a folder's name never cut at a dot.
+        case archiveUtility
+    }
+
     /// An item's name in `folder`, then the names it gets when that one is
-    /// taken: `-1`, `-2`… for The Unarchiver, ` 2`, ` 3`… for Keka,
-    /// ` (2)`, ` (3)`… for MacPacker, a file's number before its extension.
+    /// taken, the way `tool` numbers them.
     static func numbered(_ item: String, isFolder: Bool, by tool: Tool, in folder: String) -> [String] {
+        let numbering: Numbering = switch tool {
+        case .keka: .space
+        case .macPacker: .parenthesis
+        default: .hyphen
+        }
+        return numbered(item, isFolder: isFolder, numbering: numbering, in: folder)
+    }
+
+    /// An item's name in `folder`, then the names it gets when that one is
+    /// taken: a file's number before its extension.
+    static func numbered(_ item: String, isFolder: Bool, numbering: Numbering, in folder: String) -> [String] {
         var stem = item
         var ending = ""
         if isFolder == false, let dot = item.lastIndex(of: "."), dot != item.startIndex {
             stem = String(item[..<dot])
             ending = String(item[dot...])
+            // (`archive.tar.gz`: the number goes before `.tar`.)
+            if numbering == .archiveUtility, let inner = stem.lastIndex(of: "."), inner != stem.startIndex,
+               stem[stem.index(after: inner)...].lowercased() == "tar" {
+                ending = String(stem[inner...]) + ending
+                stem = String(stem[..<inner])
+            }
         }
         return (0..<resultNamesTried).map { number in
             if number == 0 { return join(folder, item) }
-            switch tool {
-            case .keka: return join(folder, "\(stem) \(number + 1)\(ending)")
-            case .macPacker: return join(folder, "\(stem) (\(number + 1))\(ending)")
-            default: return join(folder, "\(stem)-\(number)\(ending)")
+            switch numbering {
+            case .hyphen: return join(folder, "\(stem)-\(number)\(ending)")
+            case .space, .archiveUtility: return join(folder, "\(stem) \(number + 1)\(ending)")
+            case .parenthesis: return join(folder, "\(stem) (\(number + 1))\(ending)")
             }
         }
     }
@@ -1827,15 +1907,31 @@ public struct Tracker: Sendable {
     /// extraction from leaving anything behind extracts into.
     static let macPackerWorkEnding = "macpack"
 
-    /// That work folder, when the place an extraction was followed into is
-    /// one or lies in one: `…/photos.macpack` (`photos (2).macpack` when
-    /// the name was taken), in the destination.
+    /// How the hidden work folder of a later MacPacker begins: it extracts a
+    /// whole archive into `.MacPacker-<a random id>` in the destination.
+    static let macPackerHiddenWorkStart = ".MacPacker-"
+
+    static func isMacPackerHiddenWorkFolder(_ name: String) -> Bool {
+        name.hasPrefix(macPackerHiddenWorkStart) && name.count > macPackerHiddenWorkStart.count
+    }
+
+    /// MacPacker's work folder, when the place an extraction was followed
+    /// into is one or lies in one: `…/photos.macpack` (`photos (2).macpack`
+    /// when the name was taken), or `…/.MacPacker-<id>`, in the destination.
     static func macPackerWorkFolder(of place: String?) -> String? {
         guard let place else { return nil }
         let parts = place.split(separator: "/", omittingEmptySubsequences: true)
         let ending = "." + macPackerWorkEnding
-        guard let work = parts.lastIndex(where: { $0.hasSuffix(ending) && $0.count > ending.count }) else { return nil }
+        guard let work = parts.lastIndex(where: {
+            ($0.hasSuffix(ending) && $0.count > ending.count) || isMacPackerHiddenWorkFolder(String($0))
+        }) else { return nil }
         return "/" + parts[...work].joined(separator: "/")
+    }
+
+    /// How MacPacker names a result whose name is taken, by its work folder:
+    /// `photos (2)` from a `.macpack` one, `photos 2` from a hidden one.
+    static func macPackerNumbering(ofWork work: String) -> Numbering {
+        isMacPackerHiddenWorkFolder(ArchiveName.fileName(of: work)) ? .archiveUtility : .parenthesis
     }
 
     /// Where MacPacker put the result once its work folder is gone. It
@@ -1843,8 +1939,10 @@ public struct Tracker: Sendable {
     /// itself, renamed, when the result is a folder made for the archive
     /// (`photos`, or `photos (2)`… when that is taken); or each item at its
     /// top moved into the folder the work folder was in, under its own
-    /// name or, when that is taken, `photo (2).jpg`. Nothing when no
-    /// result of this extraction is there.
+    /// name or, when that is taken, `photo (2).jpg`. From a hidden work
+    /// folder, a taken name is numbered as Archive Utility does it
+    /// (`photos 2`, `photo 2.jpg`). Nothing when no result of this
+    /// extraction is there.
     private func macPackerPlacedResult(_ entry: Watched, key: Key, work: String)
         -> (root: String, tops: [String: String])? {
         guard let lookup = entry.lookup else { return nil }
@@ -1858,15 +1956,16 @@ public struct Tracker: Sendable {
             guard let changed = surroundings.changeTime(path) else { return false }
             return changed >= entry.seenAt - Self.writtenMargin
         }
+        let numbering = Self.macPackerNumbering(ofWork: work)
         // The work folder renamed after the archive.
-        for folder in Self.numbered(ArchiveName.baseName(of: key.archive), isFolder: true, by: .macPacker, in: parent) {
+        for folder in Self.numbered(ArchiveName.baseName(of: key.archive), isFolder: true, numbering: numbering, in: parent) {
             guard surroundings.fileState(folder) != .missing else { break }       // (the first free name)
             if isThere(folder), surroundings.fileState(Self.join(folder, probe)) != .missing {
                 return (folder, [:])
             }
         }
         // Its items moved up, under their own names or free ones.
-        let tops = allNumberedTops(entry, lookup: lookup, root: parent, numberedBy: .macPacker)
+        let tops = allNumberedTops(entry, lookup: lookup, root: parent, numbering: numbering)
         let path = Self.onDisk(probe, in: parent, tops: tops)
         // (Put there by this extraction: an earlier copy stays put.)
         guard surroundings.fileState(path) != .missing, isThere(path) else { return nil }
