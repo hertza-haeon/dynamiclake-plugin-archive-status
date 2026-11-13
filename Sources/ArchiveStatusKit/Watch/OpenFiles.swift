@@ -127,10 +127,25 @@ public enum Tool: String, Sendable, CaseIterable {
     /// archive is opened, it unpacks it into a plain tar in its own folders,
     /// `…/Caches/ta/<a folder of its own>/<name>`, and whatever it extracts
     /// later comes from there (its source, and a real Mac, 12 Oct 2026).
+    /// Since its 1.3 betas each launch has a folder there, named by a UUID,
+    /// and the copy's folder, also named by one, is inside it.
     func keepsCopy(at path: String) -> Bool {
         guard self == .macPacker else { return false }
         let parts = path.split(separator: "/")
-        return parts.count >= 4 && parts[parts.count - 3] == "ta" && parts[parts.count - 4] == "Caches"
+        guard let ta = parts.lastIndex(of: "ta"), ta > 0, parts[ta - 1] == "Caches" else { return false }
+        let folders = parts[(ta + 1)...].dropLast()
+        switch folders.count {
+        case 1: return true
+        case 2: return folders.allSatisfy(Self.isUUID)
+        default: return false
+        }
+    }
+
+    /// Whether a name has a UUID's shape: hexadecimal digits in groups of 8,
+    /// 4, 4, 4 and 12.
+    private static func isUUID(_ name: Substring) -> Bool {
+        let groups = name.split(separator: "-", omittingEmptySubsequences: false)
+        return groups.map(\.count) == [8, 4, 4, 4, 12] && groups.allSatisfy { $0.allSatisfy(\.isHexDigit) }
     }
 
     /// Programs that start just before an unarchiver does: the Archive

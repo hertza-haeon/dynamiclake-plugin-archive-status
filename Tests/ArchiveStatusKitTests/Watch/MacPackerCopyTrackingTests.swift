@@ -49,6 +49,25 @@ struct MacPackerCopyTrackingTests {
         #expect(mac.indexReads.isEmpty)
     }
 
+    /// MacPacker's 1.3 betas keep each launch's files in a folder of its own,
+    /// so the copy lies one folder deeper. It is still the archive's.
+    @Test func aCopyInTheLaunchsFolderIsTheArchives() throws {
+        let deeper = "/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/"
+            + "9F0C2D51-6B7A-4E3C-8D21-0A4B5C6D7E8F/5B11BA9C-A1B2-4998-B832-59CDEEA02A4A/unknown"
+        mac.setIndex(entries, format: .compressedTar, for: archive)
+        var tracker = mac.tracker()
+        #expect(unpack(&tracker, archive, into: deeper).isEmpty)
+
+        _ = tracker.step(now: 60, processes: [macPacker([reading(deeper, size: copySize, at: 900_000_000)])])
+        _ = tracker.step(now: 60.3, processes: [
+            macPacker([reading(deeper, size: copySize, at: 131_072), writing(file(9), size: 4_000)]),
+        ])
+        let extraction = try #require(tracker.extractions.first)
+        #expect(extraction.name == "6 no index.tar.gz")
+        #expect(extraction.archivePath == archive)
+        #expect(extraction.fileCount == 1_000)
+    }
+
     @Test func whatIsExtractedFromTheCopyGoesByTheArchivesName() throws {
         mac.setIndex(entries, format: .compressedTar, for: archive)
         var tracker = mac.tracker()
@@ -510,10 +529,18 @@ struct MacPackerCopyTrackingTests {
         #expect(tracker.extractions.map(\.name) == ["6 no index.tar.gz"])
     }
 
-    /// Only MacPacker's copies, and only where it keeps them.
+    /// Only MacPacker's copies, and only where it keeps them: in a folder of
+    /// its own in `Caches/ta`, or, since MacPacker gives each launch a folder
+    /// there (its 1.3 betas), in a folder of its own in the launch's.
     @Test(arguments: [
         ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/5B11/unknown", true),
         ("/Users/me/Library/Caches/ta/5B11/photos.tar", true),
+        ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/"
+            + "9F0C2D51-6B7A-4E3C-8D21-0A4B5C6D7E8F/5B11BA9C-A1B2-4998-B832-59CDEEA02A4A/many.tar", true),
+        ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/"
+            + "9F0C2D51-6B7A-4E3C-8D21-0A4B5C6D7E8F/5B11BA9C-A1B2-4998-B832-59CDEEA02A4A/folder/file.txt", false),
+        ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/"
+            + "5B11BA9C-A1B2-4998-B832-59CDEEA02A4A/folder/file.txt", false),
         ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/5B11/folder/file.txt", false),
         ("/Users/me/Library/Containers/com.sarensx.MacPacker/Data/Library/Caches/ta/unknown", false),
         ("/Users/me/Library/Caches/other/5B11/unknown", false),
